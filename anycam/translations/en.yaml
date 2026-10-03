@@ -1,0 +1,143 @@
+configuration:
+  low_fps_mode:
+    name: Low FPS Mode
+    description: >-
+      Recommended ON. Reduces HEVC output to 2 fps while ffmpeg still
+      decodes at source rate. Dramatically cuts CPU encode/pipe cost with
+      minimal visual impact for security monitoring.
+  skip_nonref:
+    name: Skip Non-Reference Frames
+    description: >-
+      Default OFF. Adds -skip_frame nonref to ffmpeg input. Skips B/P
+      frames during HEVC decode, reducing CPU ~40%. Causes slight choppiness.
+      Use if streams still degrade with Low FPS Mode.
+  limit_threads:
+    name: Limit Threads
+    description: >-
+      Recommended ON. Limits each ffmpeg process to 2 threads, preventing
+      any one stream from monopolizing all 4 Pi cores and starving other cameras.
+  stagger_polling:
+    name: Stagger Polling
+    description: >-
+      Default OFF. Offsets each camera's decode loop start by 40ms per
+      camera index, spreading CPU spikes across time instead of all hitting
+      simultaneously. Most useful with 4 or more cameras.
+  hw_decode:
+    name: Hardware Decode
+    description: >-
+      Default OFF. Enables hardware-accelerated video decoding. At startup
+      AnyCam probes for available decoders (hevc_v4l2m2m / h264_v4l2m2m on
+      Pi 4/5, hevc_vaapi / h264_vaapi on Intel/AMD) and uses the best one
+      available for each stream's codec. Pi 4/5 hardware HEVC requires
+      dtoverlay=rpivid-v4l2 in /boot/firmware/config.txt and a reboot.
+  adaptive_quality:
+    name: Adaptive Quality (Enhanced View)
+    description: >-
+      Default ON. In enhanced view, automatically steps down through available
+      camera stream profiles and fps tiers when the stream is unstable.
+      Switching to a lower camera profile reduces both network bandwidth and
+      CPU decode cost. When OFF, enhanced view always uses the highest quality
+      profile at uncapped fps with no adaptation.
+  fast_stream_start:
+    name: Fast Stream Start (Enhanced View)
+    description: >-
+      Default OFF. When OFF, entering Enhanced View or changing the FPS/
+      Resolution dropdown waits 5-10 seconds for the hardware decoder to
+      warm up before the first frame appears (during which the previous
+      card thumbnail stays frozen on screen). When ON, AnyCam launches two
+      ffmpeg processes in parallel: a software decoder that produces a
+      first frame in ~1 second, and a hardware decoder warming up in the
+      background. As soon as the HW decoder is ready (typically 5-6s), it
+      atomically swaps in. Net result: feed visible immediately, full HW
+      acceleration once warmup completes. Slight extra bandwidth/CPU for
+      the few seconds of overlap.
+
+      2.6.1: this option now has no effect at 3840x2160 HEVC. Software
+      decode cannot produce a first frame before rpivid finishes warming
+      up at that resolution, so AnyCam suppresses the parallel decode and
+      logs the reason. It still applies below 4K and to h264 at any
+      resolution.
+  low_latency:
+    name: Low Latency Probe
+    description: >-
+      Default OFF. AnyCam always passes -fflags +nobuffer and -flags
+      low_delay to ffmpeg, which is safe on every camera. This option adds
+      three further flags that cut the time before the first frame:
+      -probesize 32, -analyzeduration 0 and -reorder_queue_size 1. They
+      carry real risk. A small probe size can stop ffmpeg identifying the
+      codec on cameras that describe themselves slowly, and a 1-packet
+      reorder queue removes the RTSP jitter buffer, which trades picture
+      artifacts for latency on a lossy link. Turn this ON to test, and
+      turn it OFF again if any camera fails to start or shows new
+      artifacts.
+  global_recording_settings:
+    name: Use Global Recording Settings
+    description: >-
+      Default OFF. Each camera has its own recording settings, set from the
+      cog on its card. Turn this ON to use the five Global settings below
+      for every camera instead; they override each camera's own settings.
+      While this is OFF, the five settings below are ignored.
+  recordings_path:
+    name: Global Recordings Path
+    description: >-
+      Used only when Use Global Recording Settings is ON. Folder for
+      motion recordings, under /media; each camera gets a sub-folder named
+      after it. Default /media/anycam. A Samba or NFS share added in Home
+      Assistant (Settings, System, Storage, Add network storage, usage
+      Media) appears under /media/NAME. This folder is also where the
+      Storage tab opens.
+  motion_detect_level:
+    name: Global Motion Sensitivity
+    description: >-
+      Used only when Use Global Recording Settings is ON. 1 is least
+      sensitive, 100 is most sensitive. Default 63. Each camera's cog menu
+      has the same setting as a slider, with a live reading of how strongly
+      recent movement registered.
+  motion_clip_length:
+    name: Global Recording Length
+    description: >-
+      Used only when Use Global Recording Settings is ON. While motion
+      continues, start a new file this often; an event shorter than this
+      is one file, named motion_DATE_TIME.mp4. A longer event is split into
+      motion_DATE_TIME_part01.mp4, part02 and so on. Lengths are
+      approximate, because a file can only end on a keyframe. Default 30s.
+  motion_cooldown_secs:
+    name: Global Motion Cooldown (seconds)
+    description: >-
+      Used only when Use Global Recording Settings is ON. Seconds with no
+      motion before recording stops. Default 5.
+  motion_clip_padding_secs:
+    name: Global Recording Tail (seconds)
+    description: >-
+      Used only when Use Global Recording Settings is ON. Extra seconds
+      recorded after the cooldown ends. Default 3.
+  unrestricted_storage_browser:
+    name: Unrestricted Storage Browser
+    description: >-
+      Default OFF. When OFF, the Storage tab shows only the recordings
+      folder. When ON, it can browse the whole file system the add-on can
+      see. Turn it on only when you need to find files elsewhere.
+  log_debug:
+    name: Log Debug
+    description: >-
+      Most detailed. Shows all probe attempts, ONVIF parse errors, RTSP
+      OPTIONS detail, snap frame counts, redirect detection, and every
+      low-level decision AnyCam makes. Use when actively diagnosing a
+      problem. Produces high log volume — turn off when not needed.
+  log_info:
+    name: Log Info
+    description: >-
+      Standard detail (recommended on). Shows camera discovery results,
+      credential attempts, stream URLs found, snap loop start/stop, and
+      all major state changes. Good balance of visibility and volume.
+  log_warning:
+    name: Log Warning
+    description: >-
+      Somewhat detailed. Shows recoverable issues — auth failures, snap
+      loop errors, probe timeouts, ffmpeg restarts, and anything AnyCam
+      is working around automatically. Recommended on at all times.
+  log_error:
+    name: Log Error
+    description: >-
+      Least detailed. Shows only fatal or unrecoverable errors that
+      require attention. Always leave this on.
