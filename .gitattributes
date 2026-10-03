@@ -1,0 +1,14 @@
+# Every file here ships to a Linux container. Keep LF line endings on every
+# platform: a run.sh checked out with CRLF on Windows does not execute.
+*               text=auto eol=lf
+*.sh            text eol=lf
+*.py            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.js            text eol=lf
+*.md            text eol=lf
+Dockerfile      text eol=lf
+
+*.png           binary
+*.jpg           binary
+*.zip           binary
