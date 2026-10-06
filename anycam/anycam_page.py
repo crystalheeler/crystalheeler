@@ -86,6 +86,16 @@ header h1{{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8p
 .feed-wrap img,.feed-wrap video{{width:100%;height:100%;object-fit:cover;display:block}}
 /* 2.6.6 live cards: the player sits over the placeholder until it plays */
 .feed-wrap anycam-video{{position:absolute;inset:0;display:block;transition:opacity .3s;cursor:pointer}}
+/* 3.1.0 (C19): an MJPEG card's live picture, the same way */
+.feed-wrap img.card-live{{position:absolute;inset:0;transition:opacity .3s;cursor:pointer}}
+/* 3.1.0 (D3): drag to move a card */
+.card-drag{{flex-shrink:0;cursor:grab;color:var(--text-dim);touch-action:none;user-select:none;
+            padding:0 2px;line-height:1.1;font-size:1rem}}
+.card-drag:hover{{color:var(--text)}}
+.camera-card.drag-src{{opacity:.5}}
+/* 3.7.0-rc2.0 (D4): a line between the cards where the dragged card lands */
+#card-drop-line{{position:fixed;display:none;z-index:50;background:var(--primary);border-radius:2px;
+                 pointer-events:none;box-shadow:0 0 6px var(--primary)}}
 .feed-placeholder{{display:flex;flex-direction:column;align-items:center;gap:6px;
                    color:var(--text-dim);font-size:.78rem;text-align:center;padding:10px}}
 .feed-placeholder svg{{opacity:.3}}
@@ -200,8 +210,6 @@ header h1{{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8p
 #focus-video{{width:100vw;height:calc(100vh - 52px - 44px);height:calc(100dvh - 52px - 44px);margin:44px 0 0 0;background:#000}}
 #focus-video anycam-video{{display:block;width:100%;height:100%}}
 #focus-video video{{object-fit:contain;background:#000}}
-.focus-engine-btn{{background:#1e1e2e;border:1px solid #555;color:#aaa;border-radius:6px;padding:3px 8px;font-size:.72rem;cursor:pointer;height:26px}}
-.focus-engine-btn:hover{{border-color:#4a9eff;color:#4a9eff}}
 #focus-bar{{position:absolute;bottom:0;left:0;right:0;height:52px;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:space-between;padding:0 16px;gap:12px;z-index:9001;border-top:1px solid #333}}
 #focus-info{{font-size:.78rem;color:#aaa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}}
 #focus-controls{{display:flex;align-items:center;gap:12px;flex-shrink:0}}
@@ -287,6 +295,52 @@ header h1{{cursor:pointer}}
 .cs-global{{font-size:.78rem;color:var(--yellow);border:1px solid var(--yellow);border-radius:8px;padding:8px 10px}}
 .cs-error{{font-size:.78rem;color:var(--red);min-height:1em}}
 .cs-modal input:disabled,.cs-modal select:disabled{{opacity:.45;cursor:not-allowed}}
+/* 3.4.0 (C17): zones in the settings panel */
+.cs-zone{{display:grid;grid-template-columns:1fr 1.4fr auto;align-items:center;gap:8px;font-size:.82rem}}
+.cs-zone-name{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.cs-zone input[type=range]{{width:100%;padding:0;border:none;background:transparent;accent-color:var(--primary)}}
+.cs-modal label.cs-check{{flex-direction:row;align-items:center;gap:8px;font-size:.84rem;color:var(--text)}}
+/* 3.7.0-rc2.0 (B28): .modal input sets width 100%, which pushed the box away from its text */
+.modal label.cs-check input[type=checkbox]{{width:auto;flex:0 0 auto;margin:0;padding:0;accent-color:var(--primary)}}
+/* 3.4.0 (C17): the drawing window over Enhanced View */
+#focus-zone-ctl{{display:flex;align-items:center;gap:10px;flex-shrink:0;font-size:.78rem;color:#ccc}}
+#focus-zone-ctl label{{display:flex;align-items:center;gap:4px;cursor:pointer}}
+#zone-svg,#zone-still{{position:fixed;z-index:9002;pointer-events:none}}
+#zone-svg.zone-edit{{pointer-events:auto;cursor:crosshair;touch-action:none}}
+#zone-svg .zone-shape{{fill:rgba(79,142,247,.18);stroke:#4f8ef7;stroke-width:2}}
+#zone-svg polyline.zone-shape{{fill:none;stroke-dasharray:6 4}}
+#zone-svg .zone-sel{{stroke:#ffd34d;fill:rgba(255,211,77,.16)}}
+#zone-svg .zone-off{{stroke:#888;fill:rgba(128,128,128,.18)}}
+#zone-svg .zone-rec{{stroke:#ff5252;fill:rgba(255,82,82,.2);stroke-width:3}}
+#zone-svg .zone-label{{fill:#fff;font-size:13px;text-anchor:middle;paint-order:stroke;stroke:#000;stroke-width:3px;pointer-events:none}}
+#zone-svg .zone-pt{{fill:#fff;stroke:#ffd34d;stroke-width:2;cursor:move}}
+#zone-svg .zone-first{{fill:#ffd34d}}
+#zone-svg .zone-near{{fill:#4cd964;stroke:#fff}}
+#zone-svg .zone-mid{{fill:rgba(255,211,77,.55);stroke:none;cursor:copy}}
+#zone-svg .zone-rubber{{stroke:#ffd34d;stroke-width:2;stroke-dasharray:4 4;pointer-events:none}}
+#zone-panel{{position:fixed;right:12px;top:56px;width:280px;max-height:calc(100dvh - 130px);overflow:auto;z-index:9003;
+             background:rgba(20,22,28,.94);border:1px solid #333;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px;color:#ddd;font-size:.8rem}}
+#zone-panel .zp-head{{font-weight:700;font-size:.9rem;display:flex;align-items:center;justify-content:space-between;
+                      gap:8px;cursor:move;touch-action:none;user-select:none;margin:-4px -4px 0;padding:4px}}
+#zone-panel .zp-fold{{background:transparent;border:1px solid #444;border-radius:6px;color:#ddd;cursor:pointer;
+                      width:28px;height:24px;line-height:1;font-size:.9rem}}
+/* 3.7.0-rc2.0 (C22): folded, only the title bar shows */
+#zone-panel.zp-folded > :not(.zp-head){{display:none}}
+#zone-panel .zp-hint{{color:#aaa;line-height:1.4}}
+#zone-panel .zp-hint.zone-bad{{color:#ff7070}}
+#zone-panel .zp-btns{{display:flex;flex-wrap:wrap;gap:6px}}
+#zone-panel .zp-end{{justify-content:flex-end}}
+#zone-panel .zp-only{{display:flex;align-items:center;gap:6px}}
+.zl-row{{border:1px solid #333;border-radius:8px;padding:8px;display:grid;grid-template-columns:1fr auto;gap:6px;cursor:pointer}}
+.zl-row.zl-sel{{border-color:#ffd34d}}
+.zl-name{{background:#111;border:1px solid #444;border-radius:6px;color:#eee;padding:4px 6px;font-size:.82rem;min-width:0}}
+.zl-lev{{grid-column:1 / span 2;display:flex;align-items:center;gap:8px}}
+.zl-lev input{{flex:1;accent-color:var(--primary)}}
+.zl-note{{grid-column:1 / span 2;color:#f5b942;font-size:.74rem}}
+.zl-empty{{color:#888}}
+.stor-zone{{margin-left:8px;font-size:.72rem;color:var(--orange);border:1px solid var(--orange);border-radius:6px;padding:0 5px}}
+@media (max-width:700px){{#zone-panel{{left:8px;right:8px;top:auto;bottom:60px;width:auto;max-height:45dvh}}
+  #focus-zone-ctl label{{display:none}}}}
 .nc-modal-inner{{width:min(460px,94vw)}}
 .nc-subtitle{{font-size:.82rem;color:var(--text-dim);margin-top:-4px}}
 .nc-reasons{{display:flex;flex-wrap:wrap;gap:7px}}
@@ -486,6 +540,12 @@ header h1{{cursor:pointer}}
     <div class="cs-peak" id="cs-peak"></div>
     <div class="cs-mode" id="cs-mode"></div>
     <div class="cs-night-note" id="cs-night-note" style="display:none"></div>
+    <div class="cs-section">Zones</div>
+    <div id="cs-zones"></div>
+    <div class="cs-peak" id="cs-zone-peaks"></div>
+    <label class="cs-check" id="cs-zones-only-row" style="display:none"><input type="checkbox" id="cs-zones-only" onchange="csZonesOnly()"> Detection in zones only</label>
+    <button class="btn btn-ghost btn-sm" onclick="csEditZones()">Edit zones</button>
+    <div class="cs-help">A zone belongs to one view of the camera. If the camera turns (PTZ), its zones no longer match the picture.</div>
     <div class="cs-section">Recording</div>
     <div class="cs-grid">
       <label>Cooldown (s)<input type="number" id="cs-cooldown" min="1" max="300"></label>
@@ -495,12 +555,54 @@ header h1{{cursor:pointer}}
     <label class="cs-full">Recording folder<input type="text" id="cs-path" spellcheck="false"></label>
     <div class="cs-help">Under /media. For a Samba or NFS share, add it in Home Assistant
       (Settings, System, Storage, Add network storage, usage Media); it appears as
-      /media/&lt;name&gt;. SFTP and FTP upload are planned for a later version.</div>
+      /media/&lt;name&gt;. To copy recordings to a server by SFTP, FTPS or FTP, use Remote Storage.</div>
+    <button class="btn btn-ghost btn-sm" onclick="openUpload(_csCamId)">&#x21E7; Remote Storage</button>
     <div class="cs-error" id="cs-error"></div>
     <div class="modal-btns">
       <button class="btn btn-ghost btn-sm" id="cs-reset" onclick="resetCamSettings()" style="margin-right:auto">Defaults</button>
       <button class="btn btn-ghost btn-sm" onclick="closeCamSettings()">Cancel</button>
       <button class="btn btn-primary btn-sm" id="cs-save" onclick="saveCamSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- 3.6.0 (C14): recording upload -->
+<div class="modal-backdrop" id="upload-modal" onclick="if(event.target.id==='upload-modal')closeUpload()">
+  <div class="modal cs-modal">
+    <h3 id="up-title">Remote Storage</h3>
+    <label id="up-mode-row" style="display:none">This camera
+      <select id="up-mode" onchange="upModeShow()">
+        <option value="global">Use the global destination</option>
+        <option value="own">Its own destination</option>
+        <option value="off">Do not upload</option>
+      </select></label>
+    <div class="cs-help" id="up-global-note"></div>
+    <div id="up-fields" style="display:flex;flex-direction:column;gap:10px">
+      <div class="cs-grid">
+        <label>Protocol<select id="up-proto" onchange="upProtoPort()">
+          <option value="sftp">SFTP</option><option value="ftps">FTPS</option><option value="ftp">FTP</option>
+        </select></label>
+        <label>Server<input type="text" id="up-host" spellcheck="false" autocomplete="off"></label>
+        <label>Port<input type="number" id="up-port" min="1" max="65535"></label>
+      </div>
+      <div class="cs-grid">
+        <label>User<input type="text" id="up-user" spellcheck="false" autocomplete="off"></label>
+        <label>Password<input type="password" id="up-pass" autocomplete="new-password"></label>
+        <label>Folder<input type="text" id="up-path" spellcheck="false"></label>
+      </div>
+      <label class="cs-check"><input type="checkbox" id="up-delete" checked> Delete the local copy after upload</label>
+      <div class="cs-help" id="up-ftp-warn" style="display:none">FTP sends the password and the
+        recordings unencrypted. Use SFTP or FTPS when the server offers them.</div>
+      <div class="cs-help">Each recording goes to &lt;folder&gt;/&lt;camera&gt;/ once it is finished.
+        A failed upload is tried again later; the file stays here until it succeeds.</div>
+    </div>
+    <div class="cs-help" id="up-status"></div>
+    <div class="cs-error" id="up-error"></div>
+    <div class="modal-btns">
+      <button class="btn btn-ghost btn-sm" id="up-remove" onclick="removeUpload()" style="margin-right:auto;display:none">Remove</button>
+      <button class="btn btn-ghost btn-sm" onclick="testUpload()">Test</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeUpload()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="saveUpload()">Save</button>
     </div>
   </div>
 </div>
@@ -577,6 +679,7 @@ header h1{{cursor:pointer}}
       <span id="disk-label">Loading...</span>
       <div id="disk-bar-track"><div id="disk-bar-fill"></div></div>
     </div>
+    <button class="btn btn-secondary btn-sm" onclick="openUpload(null)" title="Copy recordings to a server by SFTP, FTPS or FTP">&#x21E7; Remote Storage</button>
     <button class="btn btn-secondary btn-sm" onclick="loadStorage()">&#x21BB; Refresh</button>
   </div>
   <!-- Explorer pane: nav bar + column headers + file list all inside white box -->
@@ -618,15 +721,40 @@ header h1{{cursor:pointer}}
     <div>Loading feed, please wait…</div>
     <div id="focus-loading-note"></div>
   </div>
-  <div id="focus-bar">
-    <div id="focus-info">Loading…</div>
-    <div id="focus-controls">
-      <div id="focus-classic-grp" style="display:none">
-        <button class="focus-engine-btn" onclick="focusUseClassic()" title="Compare against the classic view for this session">Classic</button>
-      </div>
+  <!-- 3.4.0 (C17): detection zones -->
+  <canvas id="zone-still" style="display:none"></canvas>
+  <svg id="zone-svg" style="display:none" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div id="zone-panel" style="display:none">
+    <div class="zp-head" id="zone-head" onpointerdown="zonePanelDragStart(event)" title="Drag to move">
+      <span>Detection zones</span>
+      <button class="zp-fold" id="zone-fold" onclick="zoneFold()" title="Fold or unfold" aria-label="Fold or unfold">▾</button>
+    </div>
+    <div id="zone-hint" class="zp-hint"></div>
+    <div id="zone-list"></div>
+    <label class="zp-only"><input type="checkbox" id="zone-only" onchange="zoneOnlyChange()"> Detection in zones only</label>
+    <div class="zp-btns">
+      <button class="btn btn-ghost btn-sm" id="zone-new" onclick="zoneNew()">+ New zone</button>
+      <button class="btn btn-ghost btn-sm" id="zone-undo" onclick="zoneUndo()">Undo</button>
+      <button class="btn btn-ghost btn-sm" id="zone-close" onclick="zoneCloseShape()">Close shape</button>
+      <button class="btn btn-ghost btn-sm" id="zone-finish" onclick="zoneFinish(false)">Finish</button>
+      <button class="btn btn-ghost btn-sm" id="zone-pause" onclick="zonePause()">Pause</button>
+    </div>
+    <div class="zp-btns zp-end">
+      <button class="btn btn-ghost btn-sm" id="zone-cancel" onclick="zoneCancel()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="zoneDone()">Done</button>
     </div>
   </div>
+  <div id="focus-bar">
+    <div id="focus-info">Loading…</div>
+    <div id="focus-zone-ctl">
+      <label class="fz-show"><input type="checkbox" id="focus-zone-show" onchange="zoneShowToggle()"> Show zones</label>
+      <button class="btn btn-ghost btn-sm" onclick="zoneEditOpen()">Zones</button>
+    </div>
+    <div id="focus-controls"></div>
+  </div>
 </div>
+
+<div id="card-drop-line"></div>
 
 <!-- ── Toast notification ─────────────────────────────────────────────────── -->
 <div id="toast" style="display:none"></div>

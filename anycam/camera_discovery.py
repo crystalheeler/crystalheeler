@@ -46,7 +46,7 @@ import anycam_motion
 from anycam_motion import (
     _MOTION, _motion_keeper, _motion_load, _motion_on_frame,
     _motion_reset_prev, _motion_uses_snapshots, api_motion_all, api_motion_settings,
-    api_motion_status, api_motion_toggle,
+    api_motion_status, api_motion_toggle, api_motion_zones,
 )
 # 3.0.0-rc1.2 (E1): go2rtc.
 import anycam_go2rtc
@@ -86,15 +86,21 @@ from anycam_focus import (
 # 3.0.0-rc1.5 (E1): anycam_snap.
 import anycam_snap
 from anycam_snap import (
-    _drain_stderr, _kill_hw_preheater, _stop_proc, api_logs,
+    _drain_stderr, _stop_proc, api_logs,
     handle_snap_status, handle_snapshot, snap_loop,
 )
 # 3.0.0-rc1.5 (E1): anycam_credentials.
 import anycam_credentials
 from anycam_credentials import (
-    _match_stream_db, api_add_camera, api_clear_credentials, api_deep_reprobe,
-    api_dvr_enum_status, api_set_credentials,
+    _match_stream_db, _streams_refresh, api_add_camera, api_clear_credentials,
+    api_deep_reprobe, api_dvr_enum_status, api_set_credentials,
 )
+# 3.6.0 (C14): recording upload.
+import anycam_upload
+from anycam_upload import api_upload_settings, api_upload_test, upload_load, upload_worker
+# 3.1.0 (C19): live MJPEG cards.
+import anycam_mjpeg
+from anycam_mjpeg import _mjpeg_source, handle_mjpeg_ws
 import anycam_storage
 from anycam_storage import (
     api_storage_delete, api_storage_download, api_storage_list, api_storage_move,
@@ -211,7 +217,7 @@ OUI_MAX_AGE_DAYS = 30  # re-download once a month
 # fingerprints will be submitted automatically.
 COMMUNITY_ENDPOINT = os.environ.get("ANYCAM_COMMUNITY_URL", "")
 
-CURRENT_VERSION = "3.0.0"  # must match config.yaml
+CURRENT_VERSION = "3.7.0"  # must match config.yaml
 
 INGRESS_PATH = os.environ.get("INGRESS_PATH", "").rstrip("/")
 PORT         = int(os.environ.get("INGRESS_PORT", 8099))
@@ -220,19 +226,11 @@ PORT         = int(os.environ.get("INGRESS_PORT", 8099))
 # ── HA add-on configuration options (set in the HA UI Config tab) ─────────────
 # Read from env vars set by the HA supervisor from config.yaml options.
 # Defaults mirror the config.yaml defaults so the server works without HA too.
-CFG_LOW_FPS              = os.environ.get("LOW_FPS_MODE",   "false").lower() == "true"
-CFG_SKIP_NONREF          = os.environ.get("SKIP_NONREF",    "false").lower() == "true"
-CFG_LIMIT_THREADS        = os.environ.get("LIMIT_THREADS",  "false").lower() == "true"
-CFG_STAGGER_POLL         = os.environ.get("STAGGER_POLLING","false").lower() == "true"
 CFG_HW_DECODE            = os.environ.get("HW_DECODE",      "false").lower() == "true"
 CFG_ADAPTIVE_QUALITY     = os.environ.get("ADAPTIVE_QUALITY","false").lower() == "true"
-# 2.6.0-rc3.0 Items 2+3 — when ON, snap_loop in Enhanced View (or after
-# a tier change) launches BOTH an SW ffmpeg (for fast first frame, ~1s)
-# and an HW ffmpeg (warming up in background, ~5-6s). As soon as HW
-# produces its first frame, the active proc atomically swaps from SW to
-# HW. Without this, entering Enhanced View leaves the frozen card
-# thumbnail visible for the full 5-10s of HW warmup.
-CFG_FAST_STREAM_START    = os.environ.get("FAST_STREAM_START", "false").lower() == "true"
+# 3.0.1 (C11): Skip Non-Reference Frames, Fast Stream Start, Stagger
+# Polling, Low FPS Mode and Limit Threads are gone (CrystalHeeler,
+# 2026-10-03: the cards should run at the fullest rate possible).
 # 2.6.1 — when ON, _launch_snap adds the aggressive probe-reduction flags
 # (-probesize 32, -analyzeduration 0, -reorder_queue_size 1) on top of the
 # unconditional -fflags +nobuffer and -flags low_delay. These three cut
@@ -874,8 +872,11 @@ _FOCUS_ADAPTIVE:         dict  = {}    # camera_id → {tier_idx, locked, run_st
 #      even for a local caller. Leaving out ffmpeg also enforces zero
 #      transcode: a codec the browser cannot play produces an error and the
 #      browser falls back, instead of go2rtc quietly burning Pi CPU.
-#   3. go2rtc's RTSP server is off (listen ""). go2rtc registers its RTSP
-#      *client* before it checks that value, so reading cameras still works.
+#   3. go2rtc's RTSP server listens on 127.0.0.1 only and asks for a
+#      password made new at each start (3.3.0, C4; before, it was off).
+#      AnyCam's ffmpeg jobs read the cameras through it, so go2rtc holds one
+#      connection per camera stream; no other program can use it without
+#      the password, and nothing outside the Pi can reach it.
 #   4. The browser reaches go2rtc only through handle_go2rtc_ws, which
 #      forwards /api/ws for stream names AnyCam registered itself.
 # verify_release.py carries contracts on _go2rtc_config and
@@ -984,9 +985,69 @@ def _safe_cam(cam: dict) -> dict:
     return s
 
 
+# ── 3.1.0 (D3): one card order for every viewer ─────────────────────────────
+# The page sends the order after a card is dragged; the add-on keeps it in
+# runtime.json and returns the cameras in that order. A card is named by
+# _card_key, the same key as _stableCardKey in page_script.py: the address
+# and port survive a password entry, which changes a camera's id.
+CARD_ORDER_MAX = 500            # keys kept; more cards than this are not expected
+CARD_KEY_MAX_LEN = 200
+
+
+def _card_key(cam: dict) -> str:
+    """The card's lasting name: ip:port, plus #chN for a DVR channel."""
+    if cam.get("ip"):
+        key = f"{cam['ip']}:{cam.get('port') or ''}"
+        if cam.get("channel"):
+            key += f"#ch{cam['channel']}"
+        return key
+    return f"id:{cam.get('id', '')}"
+
+
+_CARD_ORDER: list[str] | None = None     # read from runtime.json at first use
+
+
+def _card_order() -> list[str]:
+    global _CARD_ORDER
+    if _CARD_ORDER is None:
+        _CARD_ORDER = list(load_runtime().get("card_order") or [])
+    return _CARD_ORDER
+
+
+def _cards_in_order(cams: list[dict]) -> list[dict]:
+    """The cameras in the saved card order; cards not in it keep their place at the end."""
+    order = _card_order()
+    if not order:
+        return cams
+    rank = {key: i for i, key in enumerate(order)}
+    last = len(order)
+    return [c for _, c in sorted(enumerate(cams),
+                                 key=lambda ic: (rank.get(_card_key(ic[1]), last + ic[0]),))]
+
+
+async def api_card_order(request: web.Request) -> web.Response:
+    """GET or POST /api/card_order — the saved card order, a list of card keys."""
+    global _CARD_ORDER
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        order = data.get("order") if isinstance(data, dict) else None
+        if (not isinstance(order, list) or len(order) > CARD_ORDER_MAX
+                or not all(isinstance(k, str) and 0 < len(k) <= CARD_KEY_MAX_LEN for k in order)):
+            return web.json_response({"error": "order must be a list of card keys"}, status=400)
+        _CARD_ORDER = list(dict.fromkeys(order))         # duplicates dropped, order kept
+        rt = load_runtime()
+        rt["card_order"] = _CARD_ORDER
+        save_runtime(rt)
+        log.info(f"Card order saved ({len(_CARD_ORDER)} cards)")
+    return web.json_response({"order": _card_order()})
+
+
 async def api_cameras(request: web.Request) -> web.Response:
 
-    return web.json_response([_safe_cam(c) for c in CAMERAS.values()])
+    return web.json_response([_safe_cam(c) for c in _cards_in_order(list(CAMERAS.values()))])
 
 async def api_scan(request: web.Request) -> web.Response:
 
@@ -1288,6 +1349,69 @@ async def probe_stream_details(url: str, proto: str) -> dict:
         return {}
 
 
+# ── 3.0.1: the add-on's own Supervisor entry (F10, B26) ──────────────────────
+# Every add-on may read and change its own entry, /addons/self/..., without
+# hassio_api: the path is on the Supervisor's bypass list
+# (supervisor/api/middleware/security.py).
+_SELF_SLUG: str | None = None    # local_camera_discovery, or <repository>_camera_discovery
+
+
+async def _supervisor_self(method: str, path: str,
+                           payload: dict | None = None) -> dict | None:
+    """Call the Supervisor's /addons/self/<path>; return its data, or None."""
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.request(method, f"http://supervisor/addons/self/{path}",
+                                       headers={"Authorization": f"Bearer {token}"},
+                                       json=payload) as resp:
+                if resp.status != 200:
+                    log.warning(f"Supervisor addons/self/{path}: HTTP {resp.status}")
+                    return None
+                body = await resp.json(content_type=None)
+                return (body.get("data") or {}) if isinstance(body, dict) else {}
+    except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+        log.warning(f"Supervisor addons/self/{path}: {ex}")
+        return None
+
+
+async def _store_defaults_once() -> None:
+    """3.0.1 (F10): switch on Show in Sidebar and Auto update, once.
+
+    The add-on manifest cannot set either: the Supervisor keeps them as user
+    settings with default off. Done once per installation and recorded in
+    runtime.json, so a later change by the user holds. A failure is retried
+    at the next start.
+    """
+    if load_runtime().get("store_defaults_set"):
+        return
+    if await _supervisor_self("POST", "options",
+                              {"ingress_panel": True, "auto_update": True}) is None:
+        return
+    runtime = load_runtime()
+    runtime["store_defaults_set"] = CURRENT_VERSION
+    save_runtime(runtime)
+    log.info("Home Assistant: Show in Sidebar and Auto update switched on "
+             "(one time; a later change in Home Assistant holds)")
+
+
+async def api_self(request: web.Request) -> web.Response:
+    """GET /api/self — this add-on's Home Assistant ID, for the log link (B26).
+
+    The ID is local_camera_discovery for a copy in /addons, and
+    <repository>_camera_discovery for a copy from an add-on store
+    (supervisor/store/data.py), so the page cannot know it in advance.
+    """
+    global _SELF_SLUG
+    if _SELF_SLUG is None:
+        info = await _supervisor_self("GET", "info")
+        if info and info.get("slug"):
+            _SELF_SLUG = info["slug"]
+    return web.json_response({"slug": _SELF_SLUG or "local_camera_discovery"})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Routing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1345,12 +1469,19 @@ def make_app() -> web.Application:
     app.router.add_get(   "/go2rtc/video-rtc.js",                 handle_go2rtc_player_js)
     app.router.add_post(  "/api/log_level",                        api_set_log_level)
     app.router.add_get(   "/api/logs",                            api_logs)
+    app.router.add_get(   "/api/self",                            api_self)
+    app.router.add_get(   "/api/diagnostics/hw",                  api_diagnostics_hw)
+    app.router.add_route("*", "/api/card_order",                     api_card_order)
+    app.router.add_route("*", "/api/upload/settings",                api_upload_settings)
+    app.router.add_post(  "/api/upload/test",                        api_upload_test)
+    app.router.add_get(   "/api/mjpeg/{camera_id}/ws",            handle_mjpeg_ws)
     app.router.add_post(  "/snap/focus/{camera_id}",              handle_focus_set)
     app.router.add_delete("/snap/focus",                          handle_focus_clear)
     app.router.add_post(  "/api/cameras/{camera_id}/motion",      api_motion_toggle)
     app.router.add_get(   "/api/cameras/{camera_id}/motion",      api_motion_status)
     app.router.add_get(   "/api/motion",                          api_motion_all)
     app.router.add_route("*", "/api/cameras/{camera_id}/motion/settings", api_motion_settings)
+    app.router.add_route("*", "/api/cameras/{camera_id}/motion/zones", api_motion_zones)
     app.router.add_get(   "/api/storage",                         api_storage_list)
     app.router.add_post(  "/api/storage/rename",                  api_storage_rename)
     app.router.add_post(  "/api/storage/move",                    api_storage_move)
@@ -1364,6 +1495,103 @@ def make_app() -> web.Application:
     app.router.add_post(  "/api/pscan/resume",                    api_pscan_resume)
 
     return app
+
+
+VAAPI_DEVICE = "/dev/dri/renderD128"
+
+
+async def _vaapi_usable() -> tuple[bool, str]:
+    """3.0.1 (B12): can ffmpeg open a VAAPI device? Return (yes, reason if not).
+
+    ffmpeg listing "vaapi" under -hwaccels shows only that it was built with
+    VAAPI. A Raspberry Pi 4 has a render node but no VAAPI driver, so the
+    old check reported hevc_vaapi and h264_vaapi available there.
+    """
+    if not os.path.exists(VAAPI_DEVICE):
+        return False, f"no {VAAPI_DEVICE}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-init_hw_device", f"vaapi=va:{VAAPI_DEVICE}",
+            "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1", "-f", "null", "-",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (OSError, asyncio.TimeoutError) as ex:
+        return False, f"ffmpeg could not test VAAPI: {ex}"
+    if proc.returncode != 0:
+        lines = (err or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, (f"no VAAPI driver opens {VAAPI_DEVICE}"
+                       + (f" ({lines[-1][:120]})" if lines else ""))
+    return True, ""
+
+
+# ── 3.7.0 (B11, C9): which decoder devices the add-on can use ───────────────
+# Logged at start-up, and answered by /api/diagnostics/hw, so a log shows at
+# once whether the Pi's decoders exist (C9: the rpivid overlay) and whether
+# the add-on may open them (B11). The fix for B11 waits for CrystalHeeler's
+# logs (CLAUDE.md rule 2); this only reports.
+HW_DEVICE_GLOBS = ("/dev/video*", "/dev/media*", "/dev/dri/renderD*")
+_HW_REPORT: dict = {}
+
+
+def _hw_device_report() -> dict:
+    """Each decoder device: its name, and whether it opens for reading and writing."""
+    import glob
+    devices = []
+    for pattern in HW_DEVICE_GLOBS:
+        for dev in sorted(glob.glob(pattern)):
+            name = ""
+            sysname = Path("/sys/class/video4linux") / Path(dev).name / "name"
+            if dev.startswith("/dev/video"):
+                try:
+                    name = sysname.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+            try:
+                fd = os.open(dev, os.O_RDWR | getattr(os, "O_NONBLOCK", 0))
+                os.close(fd)
+                opens = "yes"
+            except OSError as ex:
+                opens = ex.strerror or str(ex)
+            devices.append({"device": dev, "name": name, "opens": opens})
+    names = " ".join(d["name"].lower() for d in devices)
+    report = {
+        "devices": devices,
+        "rpivid": "rpivid" in names,                         # the HEVC decoder (C9)
+        "bcm2835_codec": "bcm2835-codec-decode" in names,    # the H.264 decoder
+        "blocked": [d["device"] for d in devices if d["opens"] != "yes"],
+    }
+    notes = []
+    if not devices:
+        notes.append("no decoder device is visible inside the add-on")
+    elif not report["rpivid"] and any(d["device"].startswith("/dev/video") for d in devices):
+        notes.append("no rpivid HEVC decoder: on a Pi 4, add dtoverlay=rpivid-v4l2 to "
+                     "/boot/firmware/config.txt and restart the Pi")
+    if report["blocked"]:
+        notes.append("the add-on may not open " + ", ".join(report["blocked"])
+                     + "; hardware decode on these falls back to software")
+    report["notes"] = notes
+    return report
+
+
+def _hw_report_log(report: dict) -> None:
+    for d in report["devices"]:
+        log.info(f"  HW device {d['device']}" + (f" ({d['name']})" if d["name"] else "")
+                 + (": opens" if d["opens"] == "yes" else f": cannot open — {d['opens']}"))
+    for note in report["notes"]:
+        log.warning(f"  HW decode: {note}")
+
+
+async def api_diagnostics_hw(request: web.Request) -> web.Response:
+    """GET /api/diagnostics/hw (3.7.0) — devices, decoder results, software fallbacks."""
+    report = _HW_REPORT or await asyncio.to_thread(_hw_device_report)
+    return web.json_response({
+        **report,
+        "hw_decode_setting": CFG_HW_DECODE,
+        "unavailable": sorted(_HW_UNAVAILABLE),
+        "candidates": [label for label, _c, _a in _HW_DECODER_CANDIDATES],
+        "software_fallback": dict(anycam_snap._HW_FALLBACK),
+    })
 
 
 async def _probe_hw_decoders() -> None:
@@ -1407,6 +1635,10 @@ async def _probe_hw_decoders() -> None:
         <label>: unavailable (<reason>)
       HW decoders available: <comma list> | No hardware decoders available
     """
+    # 3.7.0 (B11, C9): the devices first, also with hardware decode off
+    _HW_REPORT.clear()
+    _HW_REPORT.update(await asyncio.to_thread(_hw_device_report))
+    _hw_report_log(_HW_REPORT)
     if not CFG_HW_DECODE:
         log.info("Hardware decode disabled by config — skipping probe")
         _HW_PROBED.set()
@@ -1441,6 +1673,7 @@ async def _probe_hw_decoders() -> None:
         pass
 
     available: list[str] = []
+    vaapi_state: tuple[bool, str] | None = None     # 3.0.1 (B12): tested once
     for label, codec, args in _HW_DECODER_CANDIDATES:
         is_hwaccel = "-hwaccel" in args
 
@@ -1472,6 +1705,13 @@ async def _probe_hw_decoders() -> None:
                               "rpivid-v4l2' to /boot/firmware/config.txt "
                               "and reboot the Pi.")
                     log.info(f"  {label}: unavailable ({reason})")
+                    continue
+            if hwaccel_name == "vaapi":
+                if vaapi_state is None:
+                    vaapi_state = await _vaapi_usable()
+                if not vaapi_state[0]:
+                    _HW_UNAVAILABLE.add(label)
+                    log.info(f"  {label}: unavailable ({vaapi_state[1]})")
                     continue
             available.append(label)
             log.info(f"  {label}: available (via -hwaccel {hwaccel_name})")
@@ -1724,6 +1964,9 @@ async def main() -> None:
     # loops within MOTION_KEEPER_S, with or without a viewer.
     _motion_load()
     _MOTION_TASK = asyncio.create_task(_motion_keeper())
+    # 3.6.0 (C14): recordings waiting to upload, then the uploader
+    upload_load()
+    asyncio.create_task(upload_worker())
 
     # ── Graceful shutdown plumbing ────────────────────────────────────────────
     # _STOP_EVENT is set by SIGTERM/SIGINT handlers below. main() blocks on it,
@@ -1775,10 +2018,12 @@ async def main() -> None:
 
     # Record the current version so next startup can compare
     # Also save last scan duration so we can use it for future ETA estimates
-    _runtime_data = {"version": CURRENT_VERSION}
-    if "last_scan_duration" in load_runtime():
-        _runtime_data["last_scan_duration"] = load_runtime()["last_scan_duration"]
+    # 3.0.1: keep the F10 marker too, or the defaults would be set again.
+    _runtime_data = {k: v for k, v in load_runtime().items()
+                     if k in ("last_scan_duration", "store_defaults_set")}
+    _runtime_data["version"] = CURRENT_VERSION
     save_runtime(_runtime_data)
+    asyncio.create_task(_store_defaults_once())      # 3.0.1 (F10)
 
     # Background: download/refresh IEEE OUI database (non-blocking)
     asyncio.create_task(refresh_oui_db())
@@ -1792,7 +2037,7 @@ async def main() -> None:
 
 
 # 3.0.0-rc1.1: give the other modules the names they take from this file.
-anycam_host.bind(globals(), anycam_motion, anycam_storage, anycam_go2rtc, anycam_probe, anycam_scan, anycam_brand, anycam_page, anycam_focus, anycam_snap, anycam_credentials)
+anycam_host.bind(globals(), anycam_motion, anycam_storage, anycam_go2rtc, anycam_probe, anycam_scan, anycam_brand, anycam_page, anycam_focus, anycam_snap, anycam_credentials, anycam_mjpeg, anycam_upload)
 
 if __name__ == "__main__":
     asyncio.run(main())

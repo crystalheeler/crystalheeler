@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from aiohttp import web
 from pathlib import Path
@@ -25,15 +26,31 @@ log = logging.getLogger("anycam")
 # Taken from camera_discovery.py at start-up (anycam_host.bind).
 NEEDS = (
     'CAMERAS', 'CARD_MAX_WIDTH', '_ANSI_ESCAPE_RE', '_THREAD_POOL',
-    '_brand_throttle_seconds', '_dahua_sub_stream', '_strip_creds', '_throttle_wait_if_needed',
-    'build_authenticated_url',
+    '_brand_throttle_seconds', '_dahua_sub_stream', '_match_stream_db', '_mjpeg_source',
+    '_streams_refresh',
+    '_strip_creds', '_throttle_wait_if_needed', 'build_authenticated_url',
 )
+# 3.1.0 (B25): a card that cannot play live for one of these reasons may
+# have out-of-date saved streams, so AnyCam reads them again.
+_REFRESH_REASONS = ("no stream small enough", "no stream that can play live",
+                    "cannot play as live video", "no stream URL")
 GO2RTC_BIN             = Path("/usr/local/bin/go2rtc")
 GO2RTC_API_HOST        = "127.0.0.1"
 # Non-default ports. 1984 and 8555 are go2rtc's defaults, and another add-on
 # on a host-networked HAOS box (Frigate, the go2rtc add-on) may hold them.
 GO2RTC_API_PORT        = 28984
 GO2RTC_WEBRTC_PORT     = 28555
+# 3.3.0 (C4): go2rtc's RTSP server, for AnyCam's own ffmpeg jobs. It listens
+# on 127.0.0.1 only and asks for a password that is new at each start, so
+# no other program on the Pi can read the cameras through it (approved by
+# CrystalHeeler, 2026-10-04).
+GO2RTC_RTSP_PORT       = 28554
+GO2RTC_RTSP_USER       = "anycam"
+_GO2RTC_RTSP_PASS      = secrets.token_urlsafe(24)
+# A camera whose stream fails this many times in a row through go2rtc is
+# opened directly by ffmpeg again, as before 3.3.0, until the add-on restarts.
+RELAY_FAIL_LIMIT       = 3
+_RELAY_FAILS: dict[str, int] = {}
 GO2RTC_PLAYER_JS       = Path("/www/video-rtc.js")
 GO2RTC_READY_TIMEOUT_S = 10.0
 _GO2RTC_PROC: asyncio.subprocess.Process | None = None
@@ -56,7 +73,8 @@ def _go2rtc_config() -> str:
     return json.dumps({
         "app":    {"modules": ["api", "ws", "rtsp", "webrtc", "mp4"]},
         "api":    {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_API_PORT}"},
-        "rtsp":   {"listen": ""},
+        "rtsp":   {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_RTSP_PORT}",
+                   "username": GO2RTC_RTSP_USER, "password": _GO2RTC_RTSP_PASS},
         "webrtc": {"listen": f":{GO2RTC_WEBRTC_PORT}"},
         # warn keeps routine per-request lines out of the addon log. Source
         # URLs can still appear in a warning; _go2rtc_log_pump strips creds.
@@ -188,6 +206,55 @@ def _go2rtc_stream_name(camera_id: str, prof_idx: int, kind: str = "p") -> str:
     return f"anycam_{tag}_{digest}_{kind}{prof_idx}"
 
 
+def _go2rtc_shared_name(camera_id: str, src: str) -> str:
+    """3.3.0 (C4): one go2rtc stream name for one camera source.
+
+    Every user of the same source (a live card, Enhanced View, the snapshot
+    loop, motion detection, the recording buffer) gets the same name, so
+    go2rtc holds one connection to the camera for all of them. A name never
+    changes its source, so no user's stream is swapped under it. The hash
+    is of the address without its password: the name reaches the browser.
+    """
+    tag = re.sub(r"[^A-Za-z0-9]", "_", camera_id)[:40]
+    digest = hashlib.sha1(f"{camera_id}\n{_strip_creds(src)}".encode("utf-8")).hexdigest()[:10]
+    return f"anycam_{tag}_{digest}"
+
+
+async def _go2rtc_relay(camera_id: str, url: str | None) -> str | None:
+    """3.3.0 (C4): the address of go2rtc's copy of an RTSP stream, for ffmpeg.
+
+    Returns the camera's own address when go2rtc cannot serve it: go2rtc not
+    running, not an RTSP address, the stream not accepted, or the camera
+    already failed RELAY_FAIL_LIMIT times through go2rtc.
+    """
+    if (not url or not url.lower().startswith(("rtsp://", "rtsps://")) or not _GO2RTC_READY
+            or _RELAY_FAILS.get(camera_id, 0) >= RELAY_FAIL_LIMIT):
+        return url
+    name = _go2rtc_shared_name(camera_id, url)
+    if not await _go2rtc_register(name, url, camera_id):
+        return url
+    return (f"rtsp://{GO2RTC_RTSP_USER}:{_GO2RTC_RTSP_PASS}@{GO2RTC_API_HOST}:"
+            f"{GO2RTC_RTSP_PORT}/{name}")
+
+
+def _go2rtc_relayed(url: str | None) -> bool:
+    return f"@{GO2RTC_API_HOST}:{GO2RTC_RTSP_PORT}/" in (url or "")
+
+
+def _go2rtc_relay_result(camera_id: str, url: str | None, ok: bool) -> None:
+    """Count a run that read through go2rtc; after RELAY_FAIL_LIMIT failures, go direct."""
+    if not _go2rtc_relayed(url):
+        return
+    if ok:
+        _RELAY_FAILS.pop(camera_id, None)
+        return
+    n = _RELAY_FAILS.get(camera_id, 0) + 1
+    _RELAY_FAILS[camera_id] = n
+    if n == RELAY_FAIL_LIMIT:
+        log.warning(f"go2rtc: {camera_id} failed {n} times in a row through go2rtc — "
+                    f"AnyCam opens the camera directly from now on")
+
+
 def _go2rtc_profile_source(camera: dict,
                            prof_idx: int) -> tuple[str | None, str, str]:
     """Resolve one camera profile to an authenticated RTSP URL for go2rtc.
@@ -199,7 +266,11 @@ def _go2rtc_profile_source(camera: dict,
     _build_focus_ladder, so both engines open the same stream for the same
     profile index and the Resolution dropdown means one thing.
     """
-    if camera.get("display") in ("webrtc", "wsrtsp", "info"):
+    if camera.get("display") in ("webrtc", "wsrtsp"):
+        if prof_idx != 0:
+            return None, "", f"profile {prof_idx} does not exist"
+        return _go2rtc_native_source(camera)
+    if camera.get("display") in ("info", "appliance"):
         return None, "", "this camera is not an RTSP stream"
     profiles = _go2rtc_profiles(camera)
     if not 0 <= prof_idx < len(profiles):
@@ -207,6 +278,33 @@ def _go2rtc_profile_source(camera: dict,
     prof = profiles[prof_idx]
     raw = prof.get("url") or camera.get(prof.get("_url_key", "stream_url"))
     return _go2rtc_relay_url(camera, raw, (prof.get("stream_codec") or "").lower())
+
+
+def _go2rtc_native_source(camera: dict) -> tuple[str | None, str, str]:
+    """3.2.0 (C6): the go2rtc source for a WebRTC or RTSP-over-WebSocket camera.
+
+    Before 3.2.0 these cameras had an information card only. go2rtc
+    1.9.14 plays both with the modules already loaded: a WHEP source
+    (webrtc:http://..., the POST-an-offer endpoint probe_webrtc finds) and
+    RTSP with a WebSocket transport (rtsp://...#transport=ws://...). The
+    RTSP path inside the WebSocket is the brand's first stream-table path,
+    else "/".
+    """
+    display = camera.get("display")
+    if display == "webrtc":
+        sig = camera.get("signaling_url") or camera.get("stream_url") or ""
+        if not sig.lower().startswith(("http://", "https://")):
+            return None, "", "no WebRTC signalling address"
+        return f"webrtc:{build_authenticated_url(camera, url=sig) or sig}", "", "ok"
+    if display == "wsrtsp":
+        ws = camera.get("ws_url") or camera.get("stream_url") or ""
+        if not ws.lower().startswith(("ws://", "wss://")):
+            return None, "", "no WebSocket address"
+        entry = _match_stream_db(camera) or {}
+        path = (entry.get("rtsp") or ["/"])[0]
+        rtsp = f"rtsp://{camera.get('ip', '')}:{entry.get('port') or 554}{path}"
+        return f"{build_authenticated_url(camera, url=rtsp) or rtsp}#transport={ws}", "", "ok"
+    return None, "", "this camera is not a WebRTC or WebSocket stream"
 
 
 def _go2rtc_profiles(camera: dict) -> list[dict]:
@@ -285,16 +383,30 @@ async def _go2rtc_register(name: str, src: str, camera_id: str) -> bool:
     return True
 
 
-def _go2rtc_card_source(camera: dict) -> tuple[str | None, str, str]:
-    """Pick the stream a live card plays; return (auth url, codec, reason)."""
-    if camera.get("display") in ("webrtc", "wsrtsp", "info"):
+def _go2rtc_card_source(camera: dict, h265: bool = True,
+                        wide: bool = False) -> tuple[str | None, str, str]:
+    """Pick the stream a live card plays; return (auth url, codec, reason).
+
+    3.0.1 (C10): h265=False skips H.265 streams, for a browser that cannot
+    play them.
+    3.1.0 (C19): wide=True (a computer, not a phone) plays the smallest
+    stream even when it is wider than CARD_MAX_WIDTH. The Pi only passes
+    the bytes; the computer decodes them.
+    """
+    if camera.get("display") in ("webrtc", "wsrtsp"):
+        return _go2rtc_native_source(camera)
+    if camera.get("display") in ("info", "appliance"):
         return None, "", "this camera is not an RTSP stream"
     best: tuple[int, str, str] | None = None     # (width, url, codec)
+    skipped_h265 = False
     for prof in _go2rtc_profiles(camera):
         raw = prof.get("url") or camera.get(prof.get("_url_key", "stream_url"))
         url, codec, _ = _go2rtc_relay_url(camera, raw,
                                           (prof.get("stream_codec") or "").lower())
         if not url:
+            continue
+        if not h265 and codec in ("hevc", "h265"):
+            skipped_h265 = True
             continue
         width = prof.get("stream_width") or 0
         if best is None or (width and (not best[0] or width < best[0])):
@@ -307,8 +419,12 @@ def _go2rtc_card_source(camera: dict) -> tuple[str | None, str, str]:
             url, codec, _ = _go2rtc_relay_url(camera, sub, "")
             if url:
                 return url, codec, "ok"
+        if wide:
+            return best[1], best[2], "ok"
         return None, best[2], f"no stream small enough for a card ({best[0]} wide)"
     if best is None:
+        if skipped_h265:
+            return None, "hevc", "this browser cannot play H.265, and the camera has no other stream"
         return None, "", "no stream that can play live"
     return best[1], best[2], "ok"
 
@@ -321,23 +437,39 @@ async def api_go2rtc_card(request: web.Request) -> web.Response:
     same camera are two go2rtc streams. Never dials the camera.
     """
     camera_id = request.match_info["camera_id"]
+    camera = CAMERAS.get(camera_id)
+    # 3.1.0 (C19): an MJPEG camera plays its own MJPEG stream, through
+    # anycam_mjpeg.py; it does not need go2rtc.
+    mjpeg = _mjpeg_source(camera) if camera else None
     if not _GO2RTC_READY:
+        if mjpeg:
+            return web.json_response(_mjpeg_card(camera_id))
         # retry: go2rtc may still be starting (it starts with the web server);
         # the card uses snapshots now and tries live again later.
         return web.json_response({"ok": False, "reason": "go2rtc is not running",
                                   "retry": True})
-    camera = CAMERAS.get(camera_id)
     if not camera:
         return web.json_response({"ok": False, "reason": "camera not found"},
                                  status=404)
-    src, codec, reason = _go2rtc_card_source(camera)
+    src, codec, reason = _go2rtc_card_source(camera, h265=request.query.get("h265") != "0",
+                                             wide=request.query.get("wide") == "1")
     if not src:
+        if mjpeg:
+            return web.json_response(_mjpeg_card(camera_id))
+        if any(r in reason for r in _REFRESH_REASONS):
+            asyncio.create_task(_streams_refresh(camera_id, f"card: {reason}"))
         return web.json_response({"ok": False, "reason": reason, "codec": codec})
-    name = _go2rtc_stream_name(camera_id, 0, kind="c")
+    name = _go2rtc_shared_name(camera_id, src)     # 3.3.0 (C4): shared with the other users
     if not await _go2rtc_register(name, src, camera_id):
         return web.json_response({"ok": False,
                                   "reason": "go2rtc rejected the stream"})
     return web.json_response({"ok": True, "stream": name, "codec": codec})
+
+
+def _mjpeg_card(camera_id: str) -> dict:
+    """The answer for a card that plays the camera's MJPEG stream (3.1.0, C19)."""
+    return {"ok": True, "kind": "mjpeg", "codec": "mjpeg",
+            "url": f"/api/mjpeg/{quote(camera_id, safe='')}/ws"}
 
 
 async def handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
