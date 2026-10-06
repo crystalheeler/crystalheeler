@@ -10,6 +10,7 @@ value at the moment of use.
 import asyncio
 import datetime
 import logging
+import re
 import time
 from aiohttp import web
 from urllib.parse import urlparse, quote
@@ -24,7 +25,7 @@ from anycam_probe import (
     probe_hls, probe_mjpeg_http, probe_rtmp, probe_rtsp,
 )
 from anycam_snap import (
-    snap_loop,
+    _http_digest_header, snap_loop,
 )
 from camera_db import (
     STREAM_DB,
@@ -35,7 +36,7 @@ log = logging.getLogger("anycam")
 # Taken from camera_discovery.py at start-up (anycam_host.bind).
 NEEDS = (
     'CAMERAS', 'RTSP_PATHS', '_THREAD_POOL', '_brand_throttle_seconds',
-    '_parse_throttle_seconds', '_snap_last_access', '_snap_state', '_strip_creds',
+    '_snap_last_access', '_snap_state', '_strip_creds',
     '_throttle_wait_if_needed', 'build_authenticated_url', 'decrypt_creds', 'encrypt_creds',
     'probe_stream_details', 'save_cameras',
 )
@@ -98,7 +99,8 @@ def _match_stream_db_slug(camera: dict) -> str | None:
 
 async def _probe_db_streams(ip: str, port: int, creds: str | None,
                              db_entry: dict,
-                             existing_urls: set[str]) -> list[dict]:
+                             existing_urls: set[str],
+                             camera: dict | None = None) -> list[dict]:
     """
     Probe RTSP paths from a STREAM_DB entry.
     Returns list of {url, width, height, codec} dicts for responding paths,
@@ -143,12 +145,13 @@ async def _probe_db_streams(ip: str, port: int, creds: str | None,
     # 2.3.0: throttle awareness — even though we use one TCP socket for
     # validation now, ffprobe per match still opens its own socket, so
     # we register the validation TCP open with the tracker.
-    throttle_s = 0.0
-    # Build a minimal camera-like dict for brand lookup.  db_entry has
-    # all CAMERA_DB metadata already, so we can use it directly.
-    if db_entry.get("throttle_type") == "rate_limit_per_ip_tcp":
-        throttle_s = _parse_throttle_seconds(
-            db_entry.get("throttle_amount", "")) or 5.0
+    #
+    # 3.0.1 (B24): the cooldown comes from the camera's brand, as everywhere
+    # else in password entry. Before, it was read from db_entry, a STREAM_DB
+    # entry, which never has throttle_type (that is in CAMERA_DB), so this
+    # check and every ffprobe after it ran without the wait.
+    throttle_s = _brand_throttle_seconds(camera) if camera else 0.0
+    if throttle_s > 0:
         await _throttle_wait_if_needed(ip, throttle_s, "db_probe validation")
 
     url_results = await loop.run_in_executor(
@@ -163,7 +166,7 @@ async def _probe_db_streams(ip: str, port: int, creds: str | None,
         try:
             if throttle_s > 0:
                 await _throttle_wait_if_needed(ip, throttle_s,
-                                               f"db_probe ffprobe {url}")
+                                               f"db_probe ffprobe {_strip_creds(url)}")
             det = await probe_stream_details(url, "RTSP")
             results.append({"url": url, **det})
         except Exception:
@@ -174,6 +177,57 @@ async def _probe_db_streams(ip: str, port: int, creds: str | None,
 # brands. Tracks which (camera_id) we've already enumerated so a
 # repeated cred-auth click doesn't re-enumerate the same DVR.
 _DVR_ENUM_DONE: set = set()
+
+
+# ── 3.5.0 (D1): the channel count the DVR reports ──────────────────────────
+# Before 3.5.0 AnyCam walked channels 1 to 16 on every Lorex/Dahua DVR: an
+# 8-channel DVR got 7 needless probes, and a 32-channel NVR lost half its
+# cameras. Dahua's HTTP API (also on Lorex, which is Dahua inside) answers
+# the number of video inputs. Both answers are read, and the larger counts
+# (an NVR reports its IP channels as remote inputs).
+DVR_CHANNEL_PATHS = ("/cgi-bin/devVideoInput.cgi?action=getCollect",
+                     "/cgi-bin/magicBox.cgi?action=getProductDefinition&name=MaxRemoteInputChannels")
+DVR_CHANNEL_DEFAULT = 16       # when the DVR does not say
+DVR_CHANNEL_MAX = 256          # a larger answer is not believed
+
+
+def _dvr_parse_count(text: str) -> int | None:
+    """The number in "result=8" or "table.MaxRemoteInputChannels=32"."""
+    m = re.search(r"(?im)^\s*(?:result|table\.MaxRemoteInputChannels)\s*=\s*(\d+)\s*$", text or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= DVR_CHANNEL_MAX else None
+
+
+async def _dvr_channel_count(cam: dict, username: str, password: str) -> int | None:
+    """Ask the DVR how many channels it has; None when it does not answer."""
+    import aiohttp
+    host = urlparse(cam.get("http_snap_url") or "").netloc.split("@")[-1] or cam.get("ip", "")
+    counts = []
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout,
+                                         connector=aiohttp.TCPConnector(ssl=False)) as session:
+            for path in DVR_CHANNEL_PATHS:
+                url = f"http://{host}{path}"
+                try:
+                    async with session.get(url, auth=aiohttp.BasicAuth(username, password)) as resp:
+                        status, www, body = (resp.status, resp.headers.get("WWW-Authenticate", ""),
+                                             await resp.text(errors="replace"))
+                    if status == 401 and www.startswith("Digest"):
+                        hdr = _http_digest_header(www, "GET", path, username, password)
+                        async with session.get(url, headers={"Authorization": hdr}) as resp:
+                            status, body = resp.status, await resp.text(errors="replace")
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+                    log.debug(f"  channel count: {path.split('?')[0]} failed: {ex}")
+                    continue
+                n = _dvr_parse_count(body) if status == 200 else None
+                if n:
+                    counts.append(n)
+    except (aiohttp.ClientError, OSError) as ex:
+        log.debug(f"  channel count: {ex}")
+    return max(counts) if counts else None
 
 
 async def _enumerate_dvr_channels_after_auth(camera_id: str) -> None:
@@ -275,9 +329,19 @@ async def _enumerate_dvr_channels_after_auth(camera_id: str) -> None:
     # sub-stream variant. Sub-streams for each populated channel can be
     # discovered later by the per-card cred-auth flow.
     template = recipe.get("path_template", "")
-    raw_channels = recipe.get("channels") or list(range(1, 17))
     main_subtype = recipe.get("subtype_main", 0)
-    channel_cap  = 16
+    # 3.5.0 (D1): the DVR says how many channels it has
+    reported = await _dvr_channel_count(cam, username, password)
+    if reported:
+        channel_cap = reported
+        raw_channels = list(range(1, reported + 1))
+        log.info(f"  Channel enumeration: the DVR reports {reported} channel(s)")
+    else:
+        channel_cap = DVR_CHANNEL_DEFAULT
+        raw_channels = recipe.get("channels") or list(range(1, DVR_CHANNEL_DEFAULT + 1))
+        log.info(f"  Channel enumeration: the DVR did not report its channel count — "
+                 f"walking channels 1 to {DVR_CHANNEL_DEFAULT}")
+    cam["dvr_channels"] = reported
     candidate_paths: list[str] = []
     for ch in raw_channels:
         if ch > channel_cap:
@@ -688,7 +752,7 @@ async def api_set_credentials(request: web.Request) -> web.Response:
             if db_entry and not have_main_n_sub:
                 existing = {c["url"] for c in stream_candidates}
                 db_streams = await _probe_db_streams(ip, port, enc_creds,
-                                                     db_entry, existing)
+                                                     db_entry, existing, camera)
                 if db_streams:
                     log.info(f"  DB probe found {len(db_streams)} extra stream(s)")
                     for s in db_streams:
@@ -1033,7 +1097,7 @@ async def api_set_credentials(request: web.Request) -> web.Response:
 
     if db_entry and proto in ("RTSP", "DVR"):
         db_streams = await _probe_db_streams(ip, port, enc_creds,
-                                             db_entry, {url})
+                                             db_entry, {url}, camera)
         # 2.4.0-rc2.6: PRESERVE the main stream URL we found pre-cred-
         # auth. Previously this code sorted ALL candidates (main + DB-
         # probed sub-streams) by resolution and replaced `url` with
@@ -1337,6 +1401,59 @@ async def api_set_credentials(request: web.Request) -> web.Response:
                               "stream_url": _strip_creds(url),
                               "dvr_enumeration_pending": enum_pending,
                               **details})
+
+
+# ── 3.1.0 (B25): read a camera's streams again with the saved password ──────
+# AnyCam reads a camera's streams only when its password is entered, and saves
+# them. After a change in the camera's settings the saved streams can be out
+# of date: on 2026-10-02 the Hikvision PTZ card ran on snapshots until its
+# password was entered again. Now AnyCam does that itself when a card cannot
+# use what is saved. It runs the same password step (api_set_credentials),
+# which paces rate-limited cameras, at most once every STREAM_REFRESH_MIN_S
+# for each camera.
+STREAM_REFRESH_MIN_S = 6 * 3600.0
+_STREAM_REFRESH_AT: dict[str, float] = {}     # camera_id -> time.monotonic() of the last try
+
+
+class _SavedPasswordRequest:
+    """The one part of a request api_set_credentials reads: its JSON body."""
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+
+async def _streams_refresh(camera_id: str, why: str) -> bool:
+    """Read the camera's streams again with its saved password; True on success."""
+    camera = CAMERAS.get(camera_id)
+    if (not camera or not camera.get("credentials") or camera.get("_dvr_parent_id")
+            or camera.get("display") in ("webrtc", "wsrtsp", "info", "appliance")):
+        return False
+    now = time.monotonic()
+    last = _STREAM_REFRESH_AT.get(camera_id)
+    if last is not None and now - last < STREAM_REFRESH_MIN_S:
+        return False
+    _STREAM_REFRESH_AT[camera_id] = now
+    try:
+        username, password = decrypt_creds(camera["credentials"])
+    except Exception as exc:
+        log.debug(f"Streams [{camera_id}]: saved password unreadable: {exc}")
+        return False
+    log.info(f"Streams [{camera_id}]: reading the streams again with the saved "
+             f"password ({why})")
+    resp = await api_set_credentials(_SavedPasswordRequest(
+        {"camera_id": camera_id, "username": username, "password": password}))
+    ok = resp.status == 200
+    cam = CAMERAS.get(camera_id) or {}
+    if ok:
+        log.info(f"Streams [{camera_id}]: {len(cam.get('stream_profiles') or [])} "
+                 f"stream(s) saved again")
+    else:
+        log.warning(f"Streams [{camera_id}]: the streams could not be read again "
+                    f"(HTTP {resp.status}); the saved ones stay")
+    return ok
 
 
 async def api_clear_credentials(request: web.Request) -> web.Response:
@@ -1665,6 +1782,10 @@ async def api_add_camera(request: web.Request) -> web.Response:
     ip        = data.get("ip","").strip()
     port      = int(data.get("port", 554))
     protocol  = data.get("protocol","RTSP").upper()
+    # 3.0.1 (B23): the scan names these "WebRTC" and "WS-RTSP" (display
+    # "webrtc", "wsrtsp"). Upper case alone never matched the check below,
+    # so a WebRTC camera added by hand always failed with 400.
+    protocol  = {"WEBRTC": "WebRTC"}.get(protocol, protocol)
     name      = data.get("name","").strip() or f"{ip}:{port}"
     username  = data.get("username","").strip()
     password  = data.get("password","")
@@ -1703,7 +1824,8 @@ async def api_add_camera(request: web.Request) -> web.Response:
         "requires_credentials": False,
         "credentials": encrypt_creds(username, password) if (username and url) else None,
         "name": name, "status": "ready" if url else "info",
-        "display": "proxy" if url else protocol.lower(),
+        "display": "proxy" if url else {"WebRTC": "webrtc", "WS-RTSP": "wsrtsp"}.get(
+            protocol, protocol.lower()),
         "user_saved": True, "verdict": "camera", "verdict_reason": "Manually added",
     }
     save_cameras()

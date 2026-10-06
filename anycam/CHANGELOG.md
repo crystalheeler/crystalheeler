@@ -1,3 +1,226 @@
+## 3.7.0
+
+AnyCam gets detection zones, sound and more live cards, one camera connection through go2rtc, and recording upload. Same code as 3.7.0-rc2.0, field-tested on test system B.
+
+### Changes & improvements
+
+- **Detection zones.** Draw up to 6 areas on a camera's picture, each with its own sensitivity, so a small, far movement can record. Slow movement in a zone records too.
+- **More cards play live.** MJPEG cameras, wide streams on a computer, and cameras that speak WebRTC or RTSP over WebSocket.
+- **Sound in Enhanced View,** muted at the start, with a Sound button.
+- **One connection per camera stream.** Cards, the classic view, motion detection and recordings read the camera through go2rtc.
+- **Remote Storage.** Recordings can go to a server by SFTP, FTPS or FTP, for all cameras or for one. Passwords are stored encrypted.
+- **Drag cards into your own order.** Every viewer sees the same order.
+- **Cameras in appliances** (a litter box camera, a robot vacuum) get an information card.
+- **H.265 and the browser.** A browser that cannot play H.265 gets the camera's H.264 stream, or a plain message.
+- **A DVR is walked for the channels it reports,** not always 16.
+- **Show in Sidebar and Auto update are on** after the first start.
+- **Removed: five settings** that did nothing useful or broke cameras (Low FPS, Skip Non-Reference Frames, Limit Threads, Stagger Poll, Fast Stream Start), and the Classic button.
+
+### Bugs fixed
+
+- **Cards showed pictures that were minutes old.**
+- **A camera's saved streams went out of date** when its settings changed; AnyCam now reads them again.
+- **Adding a camera by hand with WebRTC failed,** and one password-entry step did not pace rate-limited cameras.
+- **The log link failed** for a store install; **scan progress** jumped.
+
+### Known issues
+
+- **Hardware decode falls back to software,** and the start-up log wrongly says the HEVC decoder overlay is missing (B11).
+- **Enhanced View is black for a few seconds** after you come back to the page.
+- **The Storage tab hides the file names** on a phone held upright.
+- **The Microseven is not tested** with this release.
+
+## 3.7.0-rc2.0
+
+Four small page changes from the 3.7.0-rc1.0 field test. Not field-tested.
+
+### Changes & improvements
+
+- **The zone window moves and folds.** Drag it by its title bar; the ▾ button folds it to the title bar. Each device remembers the place.
+- **A line shows where a dragged card lands,** in the gap between two cards. On a phone held upright the line is level.
+- **"Upload" is now "Remote Storage"** on the page.
+
+### Bugs fixed
+
+- **The "Delete the local copy" checkbox stood apart from its text.** It is now next to the text, on one line.
+
+### Known issues
+
+- **Enhanced View is black for a few seconds after you come back to the page** (B27, waits for a log).
+- **The Storage tab hides the file names on a phone held upright** (C23, the Storage tab revamp).
+
+## 3.7.0-rc1.0
+
+The log now shows which hardware decoders the add-on can use, and says when a picture was decoded in software. Not field-tested.
+
+### Changes & improvements
+
+- **Decoder devices in the log.** At start-up AnyCam lists each decoder device, its name, and whether the add-on may open it. It also says when the Pi's HEVC decoder overlay (rpivid) is missing, with the line to add.
+- **A diagnostics page for decoding:** /api/diagnostics/hw lists the devices, the decoders that work, and each camera that fell back to software.
+
+### Bugs fixed
+
+- **The log said "hw first frame" when ffmpeg had fallen back to software.** It now says the picture was decoded in software, with ffmpeg's reason.
+
+### Known issues
+
+- **Hardware decode can still fall back to software.** This release only reports it; the fix needs the start-up log of this release.
+- **The Microseven is not tested** with this release.
+
+## 3.6.0-rc1.0
+
+Recordings can be uploaded to a server by SFTP, FTPS or FTP, for all cameras or for one. Not field-tested.
+
+### Changes & improvements
+
+- **Upload recordings.** Set a destination in the Storage tab (Upload). Each finished recording goes to <folder>/<camera>/ on the server.
+- **For each camera.** In a camera's settings, Upload chooses the global destination, the camera's own, or no upload.
+- **The local copy is deleted after the upload,** unless you clear that box. A failed upload is tried again after 1 min, then less often up to 30 min; the file stays until the upload succeeds, also across restarts.
+- **Passwords are stored encrypted,** like camera passwords, and never sent back to the page.
+- **Test** uploads a small file to check the destination.
+- **SFTP checks the server.** Its key is saved at the first upload; a changed key stops the uploads, with a log line.
+
+### Bugs fixed
+
+- None in this release.
+
+### Known issues
+
+- **FTP is unencrypted.** The form says so; use SFTP or FTPS where the server offers them.
+- **A recording is uploaded only when it has stopped**, not while it is still recording.
+- **The Microseven is not tested** with this release.
+
+## 3.5.0-rc1.0
+
+A Lorex or Dahua DVR is walked for the channels it reports, and the two camera databases are one. Not field-tested.
+
+### Changes & improvements
+
+- **DVR channels from the DVR.** After the password is accepted, AnyCam asks a Lorex or Dahua DVR how many channels it has and walks only those. A DVR that does not answer is walked for 16 channels, as before.
+- **One camera database.** Each brand's stream paths are now on its brand entry. The lookups give the same results as before.
+- **The scan follows the database.** A brand added with a new port is scanned on it. Today's scan uses the same 54 ports.
+
+### Bugs fixed
+
+- **A DVR with more than 16 channels showed only 16.** An 8-channel DVR was also probed 8 times for channels it does not have.
+
+### Known issues
+
+- **A channel with no camera** still answers like a camera on some DVRs; such a channel can get a card.
+- **The Microseven is not tested** with this release.
+
+## 3.4.0-rc1.0
+
+Detection zones: draw up to 6 areas on a camera's picture, each with its own sensitivity, so a small, far movement can record. Not field-tested.
+
+### Changes & improvements
+
+- **Draw detection zones.** In Enhanced View, press Zones, then click to set points; click the first point or press Enter to close a zone. Drag a point to move it, drag a line's middle to add one, right-click or long-press to remove one. Pause gives a still picture to draw on.
+- **Each zone has its own sensitivity,** measured against the zone's own area, from Off to 100. An Off zone masks its area. The camera's own sensitivity applies outside the zones, or not at all with "Detection in zones only".
+- **Slow movement in a zone records.** A zone also compares with the picture from 5 s before, so a garage door that opens slowly records.
+- **Zones in the camera's settings.** The cog panel lists the zones with their sensitivity and each zone's biggest recent change, and has an Edit zones button.
+- **Show zones** in Enhanced View draws the outlines and marks the zone that started a recording. The log and the Storage tab name that zone.
+
+### Bugs fixed
+
+- **A WebRTC or RTSP-over-WebSocket camera did not open Enhanced View** in 3.2.0-rc1.0.
+
+### Known issues
+
+- **A camera with zones is judged on a finer grid.** Its whole-picture sensitivity may need a new setting after the update.
+- **Zones belong to one view.** When a PTZ camera turns, its zones no longer match.
+- **The Microseven is not tested** with this release.
+
+## 3.3.0-rc1.0
+
+AnyCam opens each camera stream once: card pictures, the classic view, motion detection and recordings now read the camera through go2rtc. Not field-tested.
+
+### Changes & improvements
+
+- **One connection per camera stream.** go2rtc holds the camera connection, and every part of AnyCam reads its copy. An armed camera could have up to 5 connections open before. This helps cameras that limit connections, such as DVRs and the Microseven.
+- **go2rtc's RTSP server is on, for AnyCam only.** It listens on 127.0.0.1 and asks for a password that is new at each start. No other device or program can use it.
+- **Automatic way back.** A camera that fails 3 times in a row through go2rtc is opened directly again, as before.
+
+### Bugs fixed
+
+- **Opening the classic view stopped the card's stream** and opened a second camera connection, which a DVR could refuse. The classic view now reads go2rtc's copy of the stream.
+
+### Known issues
+
+- **Recordings still use their own buffer** for the 3 s before the motion. It now reads go2rtc's copy, not the camera.
+- **The Microseven is not tested** with this release.
+
+## 3.2.0-rc1.0
+
+Enhanced View plays the camera's sound, and cameras that speak WebRTC or RTSP over WebSocket now play live. Not field-tested.
+
+### Changes & improvements
+
+- **Sound in Enhanced View.** Live view now gets the camera's sound. It starts muted; the new Sound button turns it on. The button is grey when the camera sends no sound this browser can play.
+- **WebRTC cameras play live.** A camera with a WebRTC (WHEP) address had an information card only. Its card and Enhanced View now play it through go2rtc.
+- **RTSP-over-WebSocket cameras play live.** The same for a camera that carries RTSP inside a WebSocket.
+
+### Bugs fixed
+
+- None in this release.
+
+### Known issues
+
+- **Cards play no sound.** Only Enhanced View has sound.
+- **No test system has a WebRTC or RTSP-over-WebSocket camera**, so these cards are not field-tested. For an RTSP-over-WebSocket camera of an unknown brand, AnyCam asks for the root stream path.
+- **The Microseven is not tested** with this release.
+
+## 3.1.0-rc1.0
+
+More cards play live, out-of-date saved streams are read again by AnyCam itself, and you can drag cards into the order you want. Not field-tested.
+
+### Changes & improvements
+
+- **MJPEG cameras play live in their cards.** The add-on keeps one connection to the camera's MJPEG stream and passes each picture to every card that shows it. Nothing is decoded on the Pi.
+- **Wide streams play live on a computer.** A camera whose smallest stream is wider than 1,920 now plays live in its card on a computer. A phone still shows pictures for it.
+- **Drag cards to arrange them.** Drag a card by the handle at the left of its name. The add-on saves the order, so every viewer sees the same order.
+
+### Bugs fixed
+
+- **A camera's saved streams went out of date when its settings changed.** When a card cannot use the saved streams, AnyCam now reads them again with the saved password, at most once every 6 hours for each camera.
+
+### Known issues
+
+- **An MJPEG stream sent over RTSP still shows pictures.** Only an MJPEG stream over HTTP plays live in a card.
+- **Another viewer sees a new card order at the next page load.**
+- **The Microseven is not tested** with this release.
+
+## 3.0.1-rc1.0
+
+Cameras inside appliances get an information card, live view works in browsers that cannot play H.265, and cards no longer show old pictures. Not field-tested.
+
+### Changes & improvements
+
+- **Cameras in appliances.** A litter box camera (iENSO module) or a Dreame robot vacuum gets an information card: its video plays only in the maker's app. If the device asks for a login, the usual login card stays.
+- **Every skipped device is in the log.** The scan names each live device with no camera port, with its MAC address and maker.
+- **H.265 and the browser.** When the browser cannot play H.265, live view plays the camera's H.264 stream. With no H.264 stream, a plain message names the fix: "HEVC Video Extensions" for Firefox on Windows, else Chrome or Edge.
+- **Readable live-view errors.** The message says what went wrong, not go2rtc's internal text.
+- **Scan progress follows the work.** The bar moves per device, and the page shows the time spent and an estimate of the time left, from the last scan.
+- **Show in Sidebar and Auto update are on** after the first start. You can switch them off; AnyCam does not switch them on again.
+- **Removed: five settings.** Low FPS, Skip Non-Reference Frames, Limit Threads, Stagger Poll and Fast Stream Start. Saved values are ignored.
+- **Removed: the Classic button in Enhanced View.** The classic view still starts by itself when live view cannot play.
+
+### Bugs fixed
+
+- **Cards showed events minutes late.** A 4K H.265 card now decodes keyframes only, about one picture a second, and a card never shows a picture older than 10 s.
+- **An insect seen in one picture recorded on the snapshot path** when the next picture was compared with it. A picture must also differ from the picture before.
+- **A stream that keeps failing filled the log.** Motion detection retries at 10 s, then less often up to 5 min, with one warning.
+- **Adding a camera by hand with protocol WebRTC failed.**
+- **One password-entry step did not pace rate-limited cameras** such as the Microseven.
+- **The log link opened the wrong page** for an add-on installed from the store.
+- **Hardware decode chose VAAPI on a device without a VAAPI driver**, such as a Pi 4. AnyCam now tests VAAPI once before it uses it.
+- **Skip Non-Reference Frames broke H.264 cameras.** The setting is removed.
+
+### Known issues
+
+- **A camera's streams are read only when its password is entered.** After you change a camera's stream settings, enter its password again.
+- **The Microseven is not tested** with this release.
+
 ## 3.0.0
 
 AnyCam's code is split into 14 files with tests, and the scan's Cancel button works. Everything else works as in 2.6.8. Same code as 3.0.0-rc1.5, field-tested on both test systems.

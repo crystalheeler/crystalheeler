@@ -233,7 +233,9 @@ CONTRACTS = {
     # so each control below is pinned to fail the release if it is removed.
     # Exact module allowlist: adding exec, echo, expr or ffmpeg fails here.
     "_go2rtc_config":        ['{"modules": ["api", "ws", "rtsp", "webrtc", "mp4"]}',
-                              '"rtsp":   {"listen": ""}',
+                              # 3.3.0 (C4): the RTSP server on 127.0.0.1, with a password
+                              '"rtsp":   {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_RTSP_PORT}"',
+                              '"username": GO2RTC_RTSP_USER, "password": _GO2RTC_RTSP_PASS',
                               "GO2RTC_API_HOST"],
     # Inline config: a file path would let go2rtc write camera passwords to disk.
     "_go2rtc_supervisor":    ['"-config", _go2rtc_config()'],
@@ -272,7 +274,9 @@ CONTRACTS = {
                               "format=yuv420p", "_motion_night_observe"],
     "_motion_buffer":        ['"-c:v", "copy"', "_TsBuffer()", "rec_queue",
                               "_motion_write", "_stop_proc"],
-    "_motion_diff":          ["MOTION_PIXEL_DELTA", "MOTION_REGIONS", "/ sa", "/ sc"],
+    # 3.4.0 (C17): the comparison moved to _motion_cells, which also flags each cell
+    "_motion_cells":         ["MOTION_PIXEL_DELTA", "MOTION_REGIONS", "/ sa", "/ sc"],
+    "_motion_diff":          ["_motion_cells(prev, curr)"],
     "_motion_judge":         ["MOTION_LIGHT_FRACTION", "_motion_area_now(camera_id)"],
     # 2.6.7: night boost (C15).
     "_motion_area_now":      ["_motion_cfg(camera_id)", "_motion_boost(camera_id)"],
@@ -666,7 +670,8 @@ def _check_build_inputs() -> bool:
             return any(f.endswith(".whl") and "manylinux" in f and f"_{arch}" in f
                        and re.search(r"-(cp311-cp311|cp3\d+-abi3|py3-none)-", f)
                        for f in files)
-        if has("aarch64") and has("x86_64"):
+        # 3.6.0: a pure-Python wheel (asyncssh) installs on every platform
+        if any(f.endswith("-py3-none-any.whl") for f in files) or (has("aarch64") and has("x86_64")):
             ok(f"pip {name}=={ver} has CPython 3.11 wheels for aarch64 and x86_64")
         else:
             fail(f"F1 pip {name}=={ver}: no CPython 3.11 manylinux wheel for both "

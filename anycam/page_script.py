@@ -205,9 +205,16 @@ async function cancelScan() {
 
 
 /* ── Open HA addon log page ─────────────────────────────────────────────────── */
-function openHALog() {
+async function openHALog() {
   // Navigate the top-level HA window (not this ingress iframe) to the addon log page.
-  window.top.location.href = window.top.location.origin + '/config/app/local_camera_discovery/logs';
+  // 3.0.1 (B26): the add-on's ID differs between a copy in /addons and a copy
+  // from an add-on store, so ask the add-on for it.
+  let slug = 'local_camera_discovery';
+  try {
+    const r = await (await fetch(BASE + '/api/self')).json();
+    if (r && r.slug) slug = r.slug;
+  } catch (e) {}
+  window.top.location.href = window.top.location.origin + '/config/app/' + encodeURIComponent(slug) + '/logs';
 }
 
 /* ── Camera page opener (Firefox addon or direct) ────────────────────────────── */
@@ -603,7 +610,10 @@ function _renderStorageView() {
       row.className = 'stor-row';
       row.draggable = true;
       row.innerHTML = '<div class="stor-row-name"><span>🎬</span>'
-        + '<span class="stor-row-name-text editable">' + esc(f.name) + '</span></div>'
+        + '<span class="stor-row-name-text editable">' + esc(f.name) + '</span>'
+        + (f.zone ? '<span class="stor-zone" title="The zone that started this recording">'
+                    + esc(f.zone) + '</span>' : '')   // 3.4.0 (answer 15)
+        + '</div>'
         + '<div class="stor-row-date">' + dt + '</div>'
         + '<div class="stor-row-type">' + esc(f._type) + '</div>'
         + '<div class="stor-row-size">' + sz + '</div>'
@@ -646,7 +656,8 @@ function initSnaps() {
     img.style.cursor = 'pointer';
     img.onclick = () => openFocus(img.dataset.snap);
     // 2.6.6: live first; snapshots when the card cannot play live.
-    if (!cardLiveAttach(img.dataset.snap)) startSnap(img.dataset.snap);
+    // 3.2.0 (C6): never snapshots for a WebRTC or WS-RTSP camera.
+    if (!cardLiveAttach(img.dataset.snap) && !img.dataset.nosnap) startSnap(img.dataset.snap);
   });
 }
 
@@ -681,12 +692,14 @@ async function syncMotion(redraw) {
     cameras.forEach(cam => {
       const m  = all[cam.id] || {};
       const on = !!m.enabled, rec = !!m.recording;
+      _recZone[cam.id] = m.zone || null;    // 3.4.0 (answer 16)
       if (on !== !!_motionEnabled[cam.id] || rec !== !!_recording[cam.id]) {
         _motionEnabled[cam.id] = on;
         _recording[cam.id]     = rec;
         if (redraw) updateCard(cam);
       }
     });
+    if (_zoneShow) _zoneDraw();
   } catch(e) {}
 }
 setInterval(() => syncMotion(true), 3000);
@@ -747,6 +760,7 @@ function _csFill(d) {
   ['cs-level', 'cs-cooldown', 'cs-tail', 'cs-clip', 'cs-path', 'cs-save', 'cs-reset']
     .forEach(id => { document.getElementById(id).disabled = off; });
   document.getElementById('cs-global').style.display = off ? '' : 'none';
+  _csZonesFill(d, off);
 }
 
 function csLevelShow() {
@@ -767,6 +781,12 @@ function _csPeak(d) {
   note.textContent = d.night_note || '';
   note.style.display = d.night_note ? '' : 'none';
   mark.style.display = 'none';
+  // 3.4.0 (answer 14): each zone's largest change, and outside the zones
+  const zp = document.getElementById('cs-zone-peaks');
+  zp.textContent = (d.armed && d.zone_peaks && d.zone_peaks.length)
+    ? d.zone_peaks.map(p => (p.name === null ? 'Outside the zones' : p.name) + ': peak '
+                            + p.peak.toFixed(1) + '% (records at ' + p.need.toFixed(1) + '%)').join(' · ')
+    : '';
   if (!d.armed) {
     txt.textContent = 'Arm this camera (Record button) to see how strongly movement registers.';
   } else if (d.peak_level === null || d.peak_level === undefined) {
@@ -797,9 +817,191 @@ async function saveCamSettings() {
                            body: JSON.stringify(body)});
     const d = await r.json();
     if (!r.ok) { err.textContent = d.error || 'Could not save'; return; }
+    if (!(await _csZonesSave(camId))) return;      // 3.4.0
   } catch (e) { err.textContent = 'Could not save: ' + e; return; }
   closeCamSettings();
   showToast('Settings saved');
+}
+
+/* ── 3.4.0 (C17): the camera's zones in its settings (answers 5, 14, 21) ── */
+let _csZones = null;   // {zones, zones_only, changed} as loaded for this panel
+
+function _csZonesFill(d, off) {
+  _csZones = {zones: (d.zones || []).map(z => ({name: z.name, points: z.points, level: z.level,
+                                                closed: !!z.closed})),
+              zones_only: !!d.zones_only, changed: false};
+  const box = document.getElementById('cs-zones');
+  box.innerHTML = _csZones.zones.length ? _csZones.zones.map((z, i) =>
+      '<div class="cs-zone"><span class="cs-zone-name">' + esc(z.name) + (z.closed ? '' : ' (open)') + '</span>'
+      + '<input type="range" min="0" max="100" value="' + z.level + '"' + (off ? ' disabled' : '')
+      + ' oninput="csZoneLevel(' + i + ',this.value)">'
+      + '<span class="cs-val" data-cszlev="' + i + '">' + (z.level ? z.level : 'Off') + '</span></div>').join('')
+    : '<div class="cs-help">No zones. A zone watches one part of the picture with its own sensitivity.</div>';
+  // Requirement 12: the switch shows once the camera has a zone
+  document.getElementById('cs-zones-only-row').style.display =
+    _csZones.zones.some(z => z.closed) ? '' : 'none';
+  const only = document.getElementById('cs-zones-only');
+  only.checked = _csZones.zones_only;
+  only.disabled = off;
+}
+
+function csZoneLevel(i, v) {
+  if (!_csZones || !_csZones.zones[i]) return;
+  _csZones.zones[i].level = parseInt(v, 10) || 0;
+  _csZones.changed = true;
+  const lab = document.querySelector('[data-cszlev="' + i + '"]');
+  if (lab) lab.textContent = _csZones.zones[i].level ? _csZones.zones[i].level : 'Off';
+}
+
+function csZonesOnly() {
+  if (!_csZones) return;
+  _csZones.zones_only = document.getElementById('cs-zones-only').checked;
+  _csZones.changed = true;
+}
+
+async function _csZonesSave(camId) {
+  if (!_csZones || !_csZones.changed) return true;
+  const r = await fetch(BASE + '/api/cameras/' + encodeURIComponent(camId) + '/motion/zones', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({zones: _csZones.zones, zones_only: _csZones.zones_only})});
+  if (r.ok) return true;
+  const d = await r.json().catch(() => ({}));
+  document.getElementById('cs-error').textContent = d.error || 'Could not save the zones';
+  return false;
+}
+
+// Answer 21: "Edit zones" opens Enhanced View directly in zone editing.
+async function csEditZones() {
+  const camId = _csCamId;
+  if (!camId) return;
+  closeCamSettings();
+  await openFocus(camId);
+  if (_focusCamId === camId) zoneEditOpen();
+}
+
+/* ── 3.6.0 (C14): recording upload ──────────────────────────────────────
+ * One form for the global destination (Storage tab) and for one camera
+ * (its settings). The password is never sent back to the page: an empty
+ * password field keeps the saved one.
+ */
+let _upCam = null;          // the camera the form is for; null = global
+let _upData = null;         // the last answer from /api/upload/settings
+const UP_PORTS = {sftp: 22, ftps: 21, ftp: 21};
+
+function _upURL(path) {
+  return BASE + path + (_upCam ? '?camera_id=' + encodeURIComponent(_upCam) : '');
+}
+
+async function openUpload(camId) {
+  _upCam = camId || null;
+  if (_csCamId) closeCamSettings();
+  const cam = _upCam && cameras.find(c => c.id === _upCam);
+  // 3.7.0-rc2.0 (C24): the page calls it Remote Storage
+  document.getElementById('up-title').textContent = _upCam
+    ? 'Remote Storage — ' + (cam ? displayName(cam) : _upCam) : 'Remote Storage: global destination';
+  document.getElementById('up-error').textContent = '';
+  document.getElementById('up-status').textContent = '';
+  document.getElementById('upload-modal').classList.add('open');
+  try { _upData = await (await fetch(_upURL('/api/upload/settings'))).json(); }
+  catch (e) { document.getElementById('up-error').textContent = 'Could not load: ' + e; return; }
+  _upFill();
+}
+
+function closeUpload() {
+  _upCam = null;
+  document.getElementById('upload-modal').classList.remove('open');
+}
+
+function _upFill() {
+  const d = _upData || {};
+  const camEntry = d.camera;
+  const t = camEntry ? (camEntry.target || null) : d.global;
+  document.getElementById('up-mode-row').style.display = camEntry ? '' : 'none';
+  document.getElementById('up-remove').style.display = (!camEntry && d.global) ? '' : 'none';
+  if (camEntry) document.getElementById('up-mode').value = camEntry.mode || 'global';
+  document.getElementById('up-proto').value = (t && t.protocol) || 'sftp';
+  document.getElementById('up-host').value  = (t && t.host) || '';
+  document.getElementById('up-port').value  = (t && t.port) || UP_PORTS[(t && t.protocol) || 'sftp'];
+  document.getElementById('up-user').value  = (t && t.username) || '';
+  document.getElementById('up-pass').value  = '';
+  document.getElementById('up-pass').placeholder = (t && t.has_password) ? 'saved; type to change' : '';
+  document.getElementById('up-path').value  = (t && t.path) || '/anycam';
+  document.getElementById('up-delete').checked = !t || t.delete_local !== false;
+  const g = d.global;
+  document.getElementById('up-global-note').textContent = g
+    ? 'Global destination: ' + g.protocol.toUpperCase() + ' ' + g.host + g.path
+    : 'No global destination is set (Storage tab, Remote Storage).';
+  const st = d.status || {};
+  document.getElementById('up-status').textContent = (d.queue ? d.queue + ' recording(s) waiting to upload. ' : '')
+    + (st.last_error ? 'Last error: ' + st.last_error : '');
+  upModeShow();
+}
+
+function upModeShow() {
+  const own = !_upCam || document.getElementById('up-mode').value === 'own';
+  document.getElementById('up-fields').style.display = own ? '' : 'none';
+  document.getElementById('up-global-note').style.display = (_upCam && !own) ? '' : 'none';
+  upProtoPort(false);
+}
+
+function upProtoPort(setPort) {
+  const p = document.getElementById('up-proto').value;
+  if (setPort !== false) document.getElementById('up-port').value = UP_PORTS[p];
+  document.getElementById('up-ftp-warn').style.display = p === 'ftp' ? '' : 'none';
+}
+
+function _upTarget() {
+  return {protocol: document.getElementById('up-proto').value,
+          host: document.getElementById('up-host').value.trim(),
+          port: parseInt(document.getElementById('up-port').value, 10),
+          username: document.getElementById('up-user').value.trim(),
+          password: document.getElementById('up-pass').value,
+          path: document.getElementById('up-path').value.trim(),
+          delete_local: document.getElementById('up-delete').checked};
+}
+
+async function _upPost(path, body) {
+  const r = await fetch(_upURL(path), {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                       body: JSON.stringify(body)});
+  return [r.ok, await r.json().catch(() => ({}))];
+}
+
+async function saveUpload() {
+  const err = document.getElementById('up-error');
+  const body = _upCam ? {mode: document.getElementById('up-mode').value, target: _upTarget()} : _upTarget();
+  try {
+    const [ok, d] = await _upPost('/api/upload/settings', body);
+    if (!ok) { err.textContent = d.error || 'Could not save'; return false; }
+    _upData = d;
+  } catch (e) { err.textContent = 'Could not save: ' + e; return false; }
+  closeUpload();
+  showToast('Remote Storage settings saved');
+  return true;
+}
+
+async function removeUpload() {
+  try {
+    const [ok, d] = await _upPost('/api/upload/settings', {off: true});
+    if (!ok) { document.getElementById('up-error').textContent = d.error || 'Could not remove'; return; }
+  } catch (e) { return; }
+  closeUpload();
+  showToast('Global Remote Storage destination removed');
+}
+
+// Save first, so the test uses what is on the form.
+async function testUpload() {
+  const st = document.getElementById('up-status'), err = document.getElementById('up-error');
+  err.textContent = '';
+  const body = _upCam ? {mode: document.getElementById('up-mode').value, target: _upTarget()} : _upTarget();
+  const [ok, d] = await _upPost('/api/upload/settings', body).catch(e => [false, {error: String(e)}]);
+  if (!ok) { err.textContent = d.error || 'Could not save'; return; }
+  _upData = d;
+  document.getElementById('up-pass').value = '';
+  document.getElementById('up-pass').placeholder = 'saved; type to change';
+  st.textContent = 'Testing…';
+  const [, t] = await _upPost('/api/upload/test', {}).catch(e => [false, {ok: false, error: String(e)}]);
+  st.textContent = t.ok ? 'Test file uploaded: ' + t.remote : '';
+  if (!t.ok) err.textContent = 'Test failed: ' + (t.error || 'no answer');
 }
 
 async function resetCamSettings() {
@@ -908,6 +1110,59 @@ function _go2rtcLoadPlayer() {
 }
 
 // Ask the server for a go2rtc stream for one camera profile.
+/* ── 3.0.1 (C10): H.265 and the browser ─────────────────────────────────
+ * Chrome and Edge play H.265. Firefox plays it only on Windows, through
+ * Windows itself, which needs Microsoft's "HEVC Video Extensions" and a
+ * graphics chip that decodes H.265. A page cannot install a codec. So the
+ * page asks the browser first: when it cannot play H.265, Enhanced View
+ * plays the camera's own H.264 stream if it has one, cards skip H.265
+ * streams, and otherwise the user gets a plain message.
+ */
+let _h265Support = null;
+function _browserPlaysH265() {
+  if (_h265Support !== null) return _h265Support;
+  let ok = false;
+  try {
+    const MS = window.ManagedMediaSource || window.MediaSource;
+    ok = !!(MS && MS.isTypeSupported
+            && (MS.isTypeSupported('video/mp4; codecs="hvc1.1.6.L153.B0"')
+                || MS.isTypeSupported('video/mp4; codecs="hev1.1.6.L153.B0"')));
+  } catch (e) {}
+  _h265Support = ok;
+  return ok;
+}
+
+function _isH265(codec) {
+  const c = String(codec || '').toLowerCase();
+  return c === 'hevc' || c === 'h265';
+}
+
+function _h264ProfileIdx(cam) {
+  const ps = (cam && cam.stream_profiles) || [];
+  for (let i = 0; i < ps.length; i++) {
+    if (String(ps[i].stream_codec || '').toLowerCase() === 'h264') return i;
+  }
+  return -1;
+}
+
+function _h265Help() {
+  const ua = navigator.userAgent || '';
+  if (/Windows/.test(ua) && /Firefox\//.test(ua))
+    return 'This browser cannot play H.265 video. Install "HEVC Video Extensions" from the '
+         + 'Microsoft Store, or use Chrome or Edge.';
+  return 'This browser cannot play H.265 video. Use Chrome or Edge.';
+}
+
+// go2rtc's error text, for a person. The original stays in the console.
+function _readableLiveError(reason) {
+  const r = String(reason || '');
+  if (/codecs not matched/i.test(r) && /H26?5|hevc/i.test(r)) return 'this browser cannot play H.265 video';
+  if (/codecs not matched/i.test(r)) return "this browser cannot play this camera's video format";
+  if (/ICE|webrtc\/offer|webrtc\/answer/i.test(r)) return 'the live connection could not be set up';
+  if (/^no video within|^connection closed|^no answer|^go2rtc/i.test(r)) return r;
+  return 'the live stream did not start';
+}
+
 async function _go2rtcStreamInfo(camId, profIdx) {
   try {
     const r = await fetch(BASE + '/api/go2rtc/focus/' + encodeURIComponent(camId)
@@ -925,12 +1180,25 @@ async function _go2rtcTryFocus(camId, cam, session) {
   if (_go2rtcDeclined[camId]) return false;
   if (!(await _go2rtcLoadPlayer())) return false;
   if (session !== _focusSession) return true;
-  const info = await _go2rtcStreamInfo(camId, 0);
+  let info = await _go2rtcStreamInfo(camId, 0);
   if (session !== _focusSession) return true;
   if (!info || !info.ok) {
     console.info('[AnyCam] live view not used for ' + camId + ': '
                  + ((info && info.reason) || 'no answer'));
     return false;
+  }
+  // 3.0.1 (C10): an H.265 stream in a browser that cannot play H.265
+  if (_isH265(info.codec) && !_browserPlaysH265()) {
+    const alt = _h264ProfileIdx(cam);
+    if (alt < 0) {
+      console.info('[AnyCam] live view not used for ' + camId + ': H.265 not playable here');
+      showToast(_h265Help() + ' Using the classic view.', true);
+      return false;
+    }
+    info = await _go2rtcStreamInfo(camId, alt);
+    if (session !== _focusSession) return true;
+    if (!info || !info.ok) return false;
+    showToast("This browser cannot play H.265 video, so live view plays the camera's H.264 stream.", false);
   }
   _focusCamId  = camId;
   _focusEngine = 'go2rtc';
@@ -949,7 +1217,7 @@ function _go2rtcMount(camId, cam, info, session) {
   wrap.style.display = 'block';
   const el = document.createElement('anycam-video');
   el.mode  = 'webrtc,mse';
-  el.media = 'video';
+  el.media = 'video,audio';    // 3.2.0 (C5): sound too; it starts muted
   _go2rtc = {
     el, camId, cam, session,
     stream: info.stream,
@@ -969,7 +1237,6 @@ function _go2rtcMount(camId, cam, info, session) {
   _go2rtcWatchdog = setTimeout(watchdog, GO2RTC_FIRST_FRAME_MS);
   clearInterval(_go2rtcStatsTid);
   _go2rtcStatsTid = setInterval(() => _go2rtcStats(session), 1000);
-  _go2rtcControls(true);
   _focusLoading(true);
   _go2rtcUpdateInfo();
 }
@@ -1037,13 +1304,56 @@ function _go2rtcUpdateInfo() {
   infoEl.innerHTML =
     esc(displayName(g.cam)) + ' — <b>Live (' + esc(label) + '):</b> '
     + res + ' · ' + fps + (g.codec ? ' · ' + esc(g.codec) : '');
+  _liveSoundButton();
 }
 
-// The Classic button shows only while live view is mounted. 2.6.5 removed
-// the Resolution, Frame Rate and Auto controls.
-function _go2rtcControls(on) {
-  const classic = document.getElementById('focus-classic-grp');
-  if (classic) classic.style.display = on ? '' : 'none';
+/* ── 3.2.0 (C5): sound in live view ──────────────────────────────────────
+ * Enhanced View asks go2rtc for the camera's sound as well as its video.
+ * VideoRTC offers go2rtc only the audio codecs this browser plays, so a
+ * camera whose sound the browser cannot play gives video only. The video
+ * starts muted, because browsers block sound that starts on its own; the
+ * button turns it on. Cards stay video only.
+ */
+function _liveHasAudio(g) {
+  const el = g && g.el;
+  if (!el) return false;
+  if (/mp4a|flac|opus|alaw|ulaw/i.test(el.mseCodecs || '')) return true;
+  try {
+    return !!(el.pc && el.pc.getReceivers().some(r => r.track && r.track.kind === 'audio'
+                                                      && r.track.readyState === 'live'));
+  } catch (e) { return false; }
+}
+
+function _liveSoundButton() {
+  const box = document.getElementById('focus-controls');
+  if (!box) return;
+  const g = _go2rtc;
+  const v = g && g.el && g.el.video;
+  let key = '', html = '';
+  if (g) {
+    const has = g.played && _liveHasAudio(g);
+    const on = has && v && !v.muted;
+    const title = has ? (on ? 'Turn the sound off' : 'Turn the sound on')
+                : g.played ? 'This camera sends no sound this browser can play'
+                : 'Sound: waiting for the stream';
+    key = (has ? 'a' : 'n') + (on ? '1' : '0') + (g.played ? 'p' : '');
+    html = '<button id="focus-sound" class="btn btn-ghost btn-sm" onclick="toggleLiveSound()"'
+         + (has ? '' : ' disabled') + ' title="' + title + '">'
+         + (on ? '🔊 Sound on' : '🔇 Sound off') + '</button>';
+  }
+  if (box.dataset.sound === key) return;   // redrawn only on a change, not every second
+  box.dataset.sound = key;
+  box.innerHTML = html;
+}
+
+function toggleLiveSound() {
+  const g = _go2rtc;
+  const v = g && g.el && g.el.video;
+  if (!v) return;
+  v.muted = !v.muted;
+  // A click allows sound; if the browser still refuses, stay muted.
+  if (!v.muted) Promise.resolve(v.play()).catch(() => { v.muted = true; _liveSoundButton(); });
+  _liveSoundButton();
 }
 
 function _go2rtcUnmount() {
@@ -1064,9 +1374,9 @@ function _go2rtcUnmount() {
   }
   const wrap = document.getElementById('focus-video');
   if (wrap) { wrap.innerHTML = ''; wrap.style.display = 'none'; }
+  _liveSoundButton();   // 3.2.0 (C5): no live view, no sound button
   const img = document.getElementById('focus-img');
   if (img) img.style.display = '';
-  _go2rtcControls(false);
 }
 
 // Leave live view for the classic engine inside the same focus session.
@@ -1085,18 +1395,15 @@ function _go2rtcFail(session, reason, remember) {
   console.warn('[AnyCam] live view failed for ' + g.camId + ': ' + reason
                + ' — using the classic view');
   if (remember) _go2rtcDeclined[g.camId] = reason;
+  // 3.0.1 (C10): readable text, and the fix when the browser cannot play H.265
+  const readable = _readableLiveError(reason);
+  const help = readable === 'this browser cannot play H.265 video' ? ' ' + _h265Help() : '';
   _go2rtcToClassic(g.camId, g.cam,
-                   'Live view unavailable (' + reason + ') — using the classic view', true);
+                   'Live view unavailable (' + readable + ') — using the classic view.' + help, true);
 }
 
-// "Classic" button: compare against the classic view for this session only.
-// Not remembered, so closing and reopening the camera returns to live view.
-function focusUseClassic() {
-  const g = _go2rtc;
-  if (!g) return;
-  _go2rtcToClassic(g.camId, g.cam,
-                   'Classic view for this session — reopen the camera for live view', false);
-}
+// 3.0.1 (C20): the Classic button is gone. The classic view stays as the
+// automatic fallback (_go2rtcFail, openFocus).
 
 /* ── Enhanced View loading message (2.6.5) ───────────────────────────────
  * Shown from open until the first frame of this session, in both engines.
@@ -1199,13 +1506,29 @@ function _cardLiveShow(camId) {
   if (ph) ph.style.display = 'none';
 }
 
+// 3.1.0 (C19): a phone gets still pictures for a camera whose smallest
+// stream is wider than a card needs; a computer plays it live.
+function _isPhone() {
+  const uad = navigator.userAgentData;
+  if (uad && typeof uad.mobile === 'boolean') return uad.mobile;
+  return /Android.+Mobile|iPhone|iPod|Windows Phone/i.test(navigator.userAgent || '');
+}
+
+function _cardQuery() {
+  const q = [];
+  // 3.0.1 (C10): a browser that cannot play H.265 asks for another stream
+  if (!_browserPlaysH265()) q.push('h265=0');
+  if (!_isPhone()) q.push('wide=1');
+  return q.length ? '?' + q.join('&') : '';
+}
+
 async function _cardLiveStart(camId) {
   const st = {el: null, played: false, modes: [], errs: {}, closes: 0, tid: 0};
   _cardLive[camId] = st;
-  if (!(await _go2rtcLoadPlayer())) { _cardLiveFail(camId, st, 'player did not load', true); return; }
   let info = null;
   try {
-    info = await (await fetch(BASE + '/api/go2rtc/card/' + encodeURIComponent(camId))).json();
+    info = await (await fetch(BASE + '/api/go2rtc/card/' + encodeURIComponent(camId)
+                              + _cardQuery())).json();
   } catch (e) {}
   if (_cardLive[camId] !== st) return;
   if (!info || !info.ok) {
@@ -1214,6 +1537,9 @@ async function _cardLiveStart(camId) {
     _cardLiveFail(camId, st, (info && info.reason) || 'no answer from the addon', !!info && !info.retry);
     return;
   }
+  if (info.kind === 'mjpeg') { _cardLiveMjpeg(camId, st, info); return; }
+  if (!(await _go2rtcLoadPlayer())) { _cardLiveFail(camId, st, 'player did not load', true); return; }
+  if (_cardLive[camId] !== st) return;
   const el = document.createElement('anycam-video');
   el.className = 'card-live';
   el.mode  = 'webrtc,mse';
@@ -1230,6 +1556,90 @@ async function _cardLiveStart(camId) {
   if (!_cardLiveTick) _cardLiveTick = setInterval(_cardLiveCheck, 1000);
 }
 
+/* ── 3.1.0 (C19): a card that plays the camera's MJPEG stream ────────────
+ * The add-on sends each JPEG over a WebSocket (anycam_mjpeg.py); the card
+ * shows the newest one. A picture that arrives while the one before is
+ * still loading replaces the waiting one, so the card never falls behind.
+ */
+function _wsURL(path) {
+  const u = new URL(BASE + path, location.href);
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+  return u.href;
+}
+
+function _cardLiveMjpeg(camId, st, info) {
+  const img = document.createElement('img');
+  img.className = 'card-live';
+  img.alt = 'Live';
+  img.style.opacity = '0';
+  img.onclick = () => openFocus(camId);
+  st.el = img;
+  st.kind = 'mjpeg';
+  st.url = info.url;
+  _cardLivePlace(camId);
+  if (!img.isConnected) { _cardLiveFail(camId, st, 'card is gone', false); return; }
+  if (!document.hidden && !_focusCamId) _cardMjpegOpen(camId, st);
+  else st.paused = true;
+  _cardLiveArm(camId, st);
+}
+
+function _cardMjpegOpen(camId, st) {
+  if (st.ws) return;
+  let ws;
+  try { ws = new WebSocket(_wsURL(st.url)); }
+  catch (e) { _cardLiveFail(camId, st, 'the live stream could not open', false); return; }
+  ws.binaryType = 'blob';
+  st.ws = ws;
+  ws.onmessage = ev => {
+    if (_cardLive[camId] !== st || st.ws !== ws) return;
+    if (typeof ev.data === 'string') { _cardLiveFail(camId, st, ev.data.replace(/^error: /, ''), false); return; }
+    if (st.loading) { st.next = ev.data; return; }
+    _cardMjpegShow(camId, st, ev.data);
+  };
+  ws.onclose = () => {
+    if (st.ws !== ws) return;
+    st.ws = null;
+    if (_cardLive[camId] === st) _cardLiveFail(camId, st, 'the live stream closed', false);
+  };
+}
+
+function _cardMjpegShow(camId, st, blob) {
+  st.loading = true;
+  const url = URL.createObjectURL(blob);
+  const done = ok => {
+    URL.revokeObjectURL(url);     // the shown picture stays; only the blob goes
+    st.loading = false;
+    if (_cardLive[camId] !== st) return;
+    if (ok) _cardLivePlayed(camId, st);
+    const next = st.next;
+    st.next = null;
+    if (next) _cardMjpegShow(camId, st, next);
+  };
+  st.el.onload  = () => done(true);
+  st.el.onerror = () => done(false);
+  st.el.src = url;
+}
+
+function _cardMjpegClose(st) {
+  const ws = st.ws;
+  st.ws = null;
+  st.next = null;
+  if (ws) { ws.onmessage = null; ws.onclose = null; try { ws.close(); } catch (e) {} }
+}
+
+// A hidden page or an open Enhanced View closes the MJPEG streams, as
+// VideoRTC does for the other live cards.
+function _cardMjpegPause(pause) {
+  Object.keys(_cardLive).forEach(camId => {
+    const st = _cardLive[camId];
+    if (st.kind !== 'mjpeg') return;
+    st.paused = pause;
+    if (pause) _cardMjpegClose(st);
+    else if (st.el && st.el.isConnected) _cardMjpegOpen(camId, st);
+  });
+}
+document.addEventListener('visibilitychange', () => _cardMjpegPause(document.hidden || !!_focusCamId));
+
 // Give up on a card that shows no video within GO2RTC_FIRST_FRAME_MS of
 // actually connecting. An off-screen or hidden player is not connected,
 // so the time does not count against it.
@@ -1237,7 +1647,8 @@ function _cardLiveArm(camId, st) {
   clearTimeout(st.tid);
   st.tid = setTimeout(() => {
     if (_cardLive[camId] !== st || st.played) return;
-    if (document.hidden || _focusCamId || !(st.el.ws || st.el.pc)) { _cardLiveArm(camId, st); return; }
+    const connected = st.kind === 'mjpeg' ? !!st.ws : !!(st.el.ws || st.el.pc);
+    if (document.hidden || _focusCamId || !connected) { _cardLiveArm(camId, st); return; }
     _cardLiveFail(camId, st, 'no video within ' + (GO2RTC_FIRST_FRAME_MS / 1000) + ' s', false);
   }, GO2RTC_FIRST_FRAME_MS);
 }
@@ -1283,6 +1694,7 @@ function _cardLiveFail(camId, st, reason, remember) {
   if (_cardLive[camId] !== st) return;
   console.info('[AnyCam] card ' + camId + ' uses snapshots: ' + reason);
   clearTimeout(st.tid);
+  if (st.kind === 'mjpeg') _cardMjpegClose(st);
   if (st.el) {
     st.el.onanycam = null;
     try { st.el.ondisconnect(); } catch (e) {}
@@ -1291,13 +1703,19 @@ function _cardLiveFail(camId, st, reason, remember) {
   }
   delete _cardLive[camId];
   _cardLiveOff[camId] = {reason, retryAt: remember ? 0 : Date.now() + CARD_LIVE_RETRY_MS};
-  if (document.querySelector('[data-snap="' + CSS.escape(camId) + '"]')) startSnap(camId);
+  const img = document.querySelector('[data-snap="' + CSS.escape(camId) + '"]');
+  // 3.2.0 (C6): a WebRTC or WS-RTSP camera has no still pictures to fall back to
+  if (img && img.dataset && img.dataset.nosnap) {
+    const ph = document.getElementById('ph-' + camId);
+    if (ph) ph.textContent = 'Live view failed: ' + reason;
+  } else if (img) startSnap(camId);
 }
 
 // Enhanced View open: stop every card's stream; closed: resume them.
 function cardLivePauseAll(pause) {
+  _cardMjpegPause(pause || document.hidden);
   Object.values(_cardLive).forEach(st => {
-    if (!st.el || !st.el.isConnected) return;
+    if (st.kind === 'mjpeg' || !st.el || !st.el.isConnected) return;
     if (pause) st.el.disconnectedCallback();
     else st.el.connectedCallback();
   });
@@ -1320,7 +1738,8 @@ let _focus4kWarnTimer = null;   // auto-dismiss timer for the 4K-fallback toast
 
 async function openFocus(camId) {
   const cam = cameras.find(c => c.id === camId);
-  if (!cam || cam.status !== 'ready') return;
+  // 3.4.0: also a WebRTC or WS-RTSP camera (status 'info'), which 3.2.0-rc1.0 plays
+  if (!cam || !(cam.status === 'ready' || cam.display === 'webrtc' || cam.display === 'wsrtsp')) return;
 
   const session = ++_focusSession;
   document.getElementById('focus-overlay').style.display = 'flex';
@@ -1568,6 +1987,11 @@ async function _startFocusPoll(camId, cam) {
 }
 
 async function closeFocus() {
+  // 3.4.0 (C17): unsaved zone changes need Done or Cancel first
+  if (_ze && _ze.dirty) { showToast('Press Done or Cancel in the zone window first', true); return; }
+  document.getElementById('focus-zone-show').checked = false;
+  if (_ze) _zoneTeardown();
+  _zoneShowOff();
   _focusSession++;          // any open still awaiting the server bails out
   _focusCamId  = null;
   _focusEngine = null;
@@ -1586,8 +2010,10 @@ async function closeFocus() {
 
 // Close focus on Escape key
 document.addEventListener('keydown', e => {
+  if (zoneKey(e)) return;   // 3.4.0: the zone window uses Esc, Enter and Backspace
   if (e.key === 'Escape' && _focusCamId) closeFocus();
   else if (e.key === 'Escape' && _csCamId) closeCamSettings();
+  else if (e.key === 'Escape' && document.getElementById('upload-modal').classList.contains('open')) closeUpload();
 });
 
 // When the browser tab returns to focus after being backgrounded, the browser
@@ -1601,6 +2027,588 @@ document.addEventListener('visibilitychange', () => {
     });
   }
 });
+
+/* ── 3.4.0 (C17): detection zones ────────────────────────────────────────
+ * The drawing window opens over Enhanced View ("Zones" in its bar, or
+ * "Edit zones" in the camera's settings). The 23 answers CrystalHeeler
+ * approved are in docs/Detection_Zones_Plan.md; the numbers below are
+ * those answers. Points are kept in picture coordinates (0 to 1), so a
+ * zone holds when the stream changes (answer 19).
+ */
+const ZONE_GRID = [128, 96], ZONE_MIN_CELLS = 24, ZONE_MAX = 6, ZONE_SNAP_PX = 12;
+let _ze = null;            // the drawing window's state while it is open
+let _zoneShow = null;      // {camId, zones} while "Show zones" is on
+const _recZone = {};       // camId -> the zone that started the current recording
+
+function _zoneClamp(v) { return Math.min(1, Math.max(0, v)); }
+
+// The element that shows the picture, and the picture's own size.
+function _zoneMedia() {
+  const still = document.getElementById('zone-still');
+  if (_ze && _ze.paused) return {el: still, w: still.width || 16, h: still.height || 9};
+  const v = _go2rtc && _go2rtc.el && _go2rtc.el.video;
+  if (v && v.videoWidth) return {el: v, w: v.videoWidth, h: v.videoHeight};
+  const img = document.getElementById('focus-img');
+  return {el: img, w: img.naturalWidth || 16, h: img.naturalHeight || 9};
+}
+
+// The picture's rectangle on screen: the media is drawn with object-fit: contain.
+function _zoneRect() {
+  const m = _zoneMedia();
+  const r = m.el.getBoundingClientRect();
+  const s = Math.min(r.width / m.w, r.height / m.h) || 1;
+  const w = m.w * s, h = m.h * s;
+  return {left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, width: w, height: h};
+}
+
+/* geometry, as in anycam_zones.py */
+function _zoneOrient(a, b, c) { return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]); }
+function _zoneSegCross(p1, p2, p3, p4) {
+  const d1 = _zoneOrient(p3, p4, p1), d2 = _zoneOrient(p3, p4, p2);
+  const d3 = _zoneOrient(p1, p2, p3), d4 = _zoneOrient(p1, p2, p4);
+  if ((d1 > 0) !== (d2 > 0) && (d3 > 0) !== (d4 > 0) && d1 && d2 && d3 && d4) return true;
+  const on = (a, b, c) => Math.min(a[0], b[0]) <= c[0] && c[0] <= Math.max(a[0], b[0])
+                       && Math.min(a[1], b[1]) <= c[1] && c[1] <= Math.max(a[1], b[1]);
+  return (d1 === 0 && on(p3, p4, p1)) || (d2 === 0 && on(p3, p4, p2))
+      || (d3 === 0 && on(p1, p2, p3)) || (d4 === 0 && on(p1, p2, p4));
+}
+function _zoneSelfCrossing(pts) {
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (j === i + 1 || (i === 0 && j === n - 1)) continue;
+      if (_zoneSegCross(pts[i], pts[(i + 1) % n], pts[j], pts[(j + 1) % n])) return true;
+    }
+  }
+  return false;
+}
+function _zoneInside(x, y, pts) {
+  let inside = false;
+  for (let i = 0, n = pts.length; i < n; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % n];
+    if ((y1 > y) !== (y2 > y) && x < x1 + (y - y1) * (x2 - x1) / (y2 - y1)) inside = !inside;
+  }
+  return inside;
+}
+function _zoneCells(pts) {
+  const [gw, gh] = ZONE_GRID;
+  let n = 0;
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++)
+    if (_zoneInside((x + 0.5) / gw, (y + 0.5) / gh, pts)) n++;
+  return n;
+}
+
+/* ── opening and leaving (answers 21 to 23) ─────────────────────────────── */
+async function zoneEditOpen() {
+  const camId = _focusCamId;
+  if (!camId || _ze) return;
+  let d;
+  try {
+    d = await (await fetch(BASE + '/api/cameras/' + encodeURIComponent(camId) + '/motion/settings')).json();
+  } catch (e) { showToast('Could not load the zones', true); return; }
+  if (camId !== _focusCamId || !d || !d.settings) return;
+  _ze = {camId, zones: (d.zones || []).map(z => ({name: z.name, points: z.points.map(p => p.slice()),
+                                                  level: z.level, closed: !!z.closed})),
+         zonesOnly: !!d.zones_only, defLevel: d.settings.level || 63,
+         sel: null, drawing: null, cursor: null, drag: null, press: 0,
+         dirty: false, paused: false, cancelArmed: 0};
+  _zoneShowOff();
+  const svg = document.getElementById('zone-svg');
+  svg.classList.add('zone-edit');
+  svg.style.display = 'block';
+  svg.onpointerdown = _zoneDown;
+  svg.onpointermove = _zoneMove;
+  svg.onpointerup = svg.onpointercancel = _zoneUp;
+  svg.ondblclick = e => { e.preventDefault(); zoneFinish(true); };
+  svg.oncontextmenu = _zoneContext;
+  document.getElementById('zone-panel').style.display = 'flex';
+  _zonePanelRestore();
+  document.getElementById('zone-only').checked = _ze.zonesOnly;
+  _zoneLayout();
+  _zoneList();
+}
+
+/* 3.7.0-rc2.0 (C22): the zone window moves by its title bar and folds to
+ * it, so it does not cover the part of the picture being drawn on. Each
+ * device keeps the place and the fold in its own browser storage. */
+const ZONE_PANEL_KEY = 'anycam.zonePanel';
+
+function _zonePanelSaved() {
+  try { return JSON.parse(localStorage.getItem(ZONE_PANEL_KEY) || 'null') || {}; }
+  catch (e) { return {}; }
+}
+
+function _zonePanelStore(v) {
+  try { localStorage.setItem(ZONE_PANEL_KEY, JSON.stringify({..._zonePanelSaved(), ...v})); }
+  catch (e) {}
+}
+
+function _zonePanelPlace(left, top) {
+  const panel = document.getElementById('zone-panel');
+  const r = panel.getBoundingClientRect();
+  const vw = window.innerWidth || 1024, vh = window.innerHeight || 768;
+  left = Math.min(Math.max(0, left), Math.max(0, vw - r.width));
+  top = Math.min(Math.max(0, top), Math.max(0, vh - 40));
+  Object.assign(panel.style, {left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto',
+                              width: r.width + 'px'});
+  return [left, top];
+}
+
+function _zonePanelRestore() {
+  const panel = document.getElementById('zone-panel');
+  const v = _zonePanelSaved();
+  panel.classList.toggle('zp-folded', !!v.folded);
+  document.getElementById('zone-fold').textContent = v.folded ? '▸' : '▾';
+  if (typeof v.left === 'number' && typeof v.top === 'number') _zonePanelPlace(v.left, v.top);
+}
+
+function zoneFold() {
+  const panel = document.getElementById('zone-panel');
+  const folded = !panel.classList.contains('zp-folded');
+  panel.classList.toggle('zp-folded', folded);
+  document.getElementById('zone-fold').textContent = folded ? '▸' : '▾';
+  _zonePanelStore({folded});
+}
+
+function zonePanelDragStart(ev) {
+  if (ev.target && ev.target.id === 'zone-fold') return;
+  if (ev.button !== undefined && ev.button !== 0) return;
+  const head = document.getElementById('zone-head');
+  const r = document.getElementById('zone-panel').getBoundingClientRect();
+  const dx = ev.clientX - r.left, dy = ev.clientY - r.top;
+  ev.preventDefault();
+  try { head.setPointerCapture(ev.pointerId); } catch (e) {}
+  head.onpointermove = e => _zonePanelPlace(e.clientX - dx, e.clientY - dy);
+  head.onpointerup = head.onpointercancel = e => {
+    head.onpointermove = head.onpointerup = head.onpointercancel = null;
+    const [left, top] = _zonePanelPlace(e.clientX - dx, e.clientY - dy);
+    _zonePanelStore({left, top});
+  };
+}
+
+function _zoneTeardown() {
+  if (_ze) clearTimeout(_ze.press);
+  _ze = null;
+  const svg = document.getElementById('zone-svg');
+  svg.onpointerdown = svg.onpointermove = svg.onpointerup = svg.onpointercancel = null;
+  svg.ondblclick = svg.oncontextmenu = null;
+  svg.classList.remove('zone-edit');
+  svg.style.display = 'none';
+  svg.innerHTML = '';
+  document.getElementById('zone-panel').style.display = 'none';
+  document.getElementById('zone-still').style.display = 'none';
+  if (_go2rtc && _go2rtc.el && _go2rtc.el.video && _go2rtc.el.video.paused) _go2rtc.el.video.play();
+  if (document.getElementById('focus-zone-show').checked) zoneShowToggle();
+}
+
+async function zoneDone() {
+  if (!_ze) return;
+  const z = _ze.zones.find(z => z.closed && _zoneSelfCrossing(z.points));
+  if (z) { _zoneHint('Two lines of "' + z.name + '" cross. Move a point first.', true); return; }
+  const names = _ze.zones.map(z => z.name.trim().toLowerCase());
+  if (names.some(n => !n) || new Set(names).size !== names.length) {
+    _zoneHint('Each zone needs its own name.', true); return;
+  }
+  try {
+    const r = await fetch(BASE + '/api/cameras/' + encodeURIComponent(_ze.camId) + '/motion/zones', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({zones: _ze.zones, zones_only: _ze.zonesOnly})});
+    const d = await r.json();
+    if (!r.ok) { _zoneHint(d.error || 'Could not save the zones', true); return; }
+  } catch (e) { _zoneHint('Could not save the zones: ' + e, true); return; }
+  _zoneTeardown();
+  showToast('Zones saved');
+}
+
+function zoneCancel() {
+  if (!_ze) return;
+  const btn = document.getElementById('zone-cancel');
+  if (_ze.dirty && !_ze.cancelArmed) {
+    _ze.cancelArmed = setTimeout(() => { if (_ze) { _ze.cancelArmed = 0; btn.textContent = 'Cancel'; } }, 3000);
+    btn.textContent = 'Discard changes?';
+    return;
+  }
+  btn.textContent = 'Cancel';
+  _zoneTeardown();
+}
+
+/* ── drawing ─────────────────────────────────────────────────────────────── */
+function _zonePt(ev) {
+  const r = _ze.rect;
+  return [_zoneClamp((ev.clientX - r.left) / r.width), _zoneClamp((ev.clientY - r.top) / r.height)];
+}
+
+function _zoneNearFirst(z, ev) {
+  const r = _ze.rect, p = z.points[0];
+  return Math.hypot(ev.clientX - (r.left + p[0] * r.width), ev.clientY - (r.top + p[1] * r.height)) <= ZONE_SNAP_PX;
+}
+
+function _zoneAt(p) {
+  for (let i = _ze.zones.length - 1; i >= 0; i--) {
+    const z = _ze.zones[i];
+    if (z.closed && _zoneInside(p[0], p[1], z.points)) return i;
+  }
+  return null;
+}
+
+function _zoneNextName() {
+  const used = new Set(_ze.zones.map(z => z.name.toLowerCase()));
+  for (let n = 1; ; n++) if (!used.has('zone ' + n)) return 'Zone ' + n;
+}
+
+function _zoneStart(p) {
+  if (_ze.zones.length >= ZONE_MAX) { _zoneHint('A camera has at most ' + ZONE_MAX + ' zones.', true); return; }
+  _ze.zones.push({name: _zoneNextName(), points: [p], level: _ze.defLevel, closed: false});
+  _ze.sel = _ze.drawing = _ze.zones.length - 1;
+  _ze.dirty = true;
+  _zoneDraw(); _zoneList();
+}
+
+function _zoneClose(i) {
+  const z = _ze.zones[i];
+  if (!z || z.points.length < 3) { _zoneHint('A zone needs at least 3 points.', true); return; }
+  if (_zoneSelfCrossing(z.points)) {
+    _zoneHint('Two lines of this zone cross. Move a point, then close the shape again.', true); return;
+  }
+  z.closed = true;
+  _ze.drawing = null;
+  _ze.dirty = true;
+  _zoneDraw(); _zoneList();
+  // Answer 7: ask for the name; "Zone N" is suggested.
+  const inp = document.querySelector('#zone-list [data-zname="' + i + '"]');
+  if (inp) { inp.focus(); inp.select(); }
+  _zoneHint('Zone closed. Type its name, and set its sensitivity.');
+}
+
+function _zoneDown(ev) {
+  if (!_ze) return;
+  ev.preventDefault();
+  _ze.rect = _zoneRect();
+  const t = ev.target, ds = (t && t.dataset) || {};
+  const zi = ds.z !== undefined ? +ds.z : null;
+  const svg = document.getElementById('zone-svg');
+  if (ds.p !== undefined && zi !== null) {          // an anchor point
+    const z = _ze.zones[zi], pi = +ds.p;
+    if (_ze.drawing === zi && pi === 0 && z.points.length >= 3) { _zoneClose(zi); return; }
+    _ze.sel = zi;
+    _ze.drag = {z: zi, p: pi, moved: false, x: ev.clientX, y: ev.clientY};
+    clearTimeout(_ze.press);
+    _ze.press = setTimeout(() => {                  // answer 2: a long press removes the point
+      if (_ze && _ze.drag && !_ze.drag.moved) { const d = _ze.drag; _ze.drag = null; _zoneRemovePoint(d.z, d.p); }
+    }, 600);
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+    _zoneDraw(); _zoneList();
+    return;
+  }
+  if (ds.m !== undefined && zi !== null) {          // a line's middle handle: a new point
+    const z = _ze.zones[zi], at = +ds.m + 1;
+    z.points.splice(at, 0, _zonePt(ev));
+    _ze.sel = zi;
+    _ze.drag = {z: zi, p: at, moved: true};
+    _ze.dirty = true;
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+    _zoneDraw();
+    return;
+  }
+  const p = _zonePt(ev);
+  // Drawing, or an open zone selected (requirement 5: drawing resumes)
+  const open = _ze.drawing !== null ? _ze.drawing
+             : (_ze.sel !== null && _ze.zones[_ze.sel] && !_ze.zones[_ze.sel].closed ? _ze.sel : null);
+  if (open !== null) {
+    const z = _ze.zones[open];
+    _ze.drawing = open;
+    if (z.points.length >= 3 && _zoneNearFirst(z, ev)) { _zoneClose(open); return; }
+    z.points.push(p);
+    z.lastAdd = Date.now();
+    _ze.dirty = true;
+    _zoneDraw(); _zoneList();
+    return;
+  }
+  const hit = _zoneAt(p);                           // answer 22: a click in a zone selects it
+  if (hit !== null) { _ze.sel = hit; _zoneDraw(); _zoneList(); return; }
+  _zoneStart(p);                                    // elsewhere: a new zone
+}
+
+function _zoneMove(ev) {
+  if (!_ze) return;
+  _ze.rect = _ze.rect || _zoneRect();
+  _ze.cursor = _zonePt(ev);
+  const d = _ze.drag;
+  if (d) {
+    if (!d.moved && Math.hypot(ev.clientX - (d.x || 0), ev.clientY - (d.y || 0)) > 3) {
+      d.moved = true; clearTimeout(_ze.press);
+    }
+    if (d.moved) { _ze.zones[d.z].points[d.p] = _ze.cursor; _ze.dirty = true; }
+  }
+  if (d || _ze.drawing !== null) _zoneDraw();
+}
+
+function _zoneUp(ev) {
+  if (!_ze) return;
+  clearTimeout(_ze.press);
+  const d = _ze.drag;
+  _ze.drag = null;
+  if (d && d.moved) {
+    const z = _ze.zones[d.z];
+    if (z.closed && _zoneSelfCrossing(z.points)) _zoneHint('Two lines of "' + z.name + '" now cross. Move a point.', true);
+    _zoneList();
+  }
+}
+
+function _zoneContext(ev) {           // answer 2: a right-click on a point removes it
+  ev.preventDefault();
+  const ds = (ev.target && ev.target.dataset) || {};
+  if (_ze && ds.p !== undefined && ds.z !== undefined) _zoneRemovePoint(+ds.z, +ds.p);
+}
+
+function _zoneRemovePoint(zi, pi) {
+  const z = _ze.zones[zi];
+  if (!z) return;
+  if (z.closed && z.points.length <= 3) { _zoneHint('A zone needs at least 3 points.', true); return; }
+  z.points.splice(pi, 1);
+  _ze.dirty = true;
+  _zoneDraw(); _zoneList();
+}
+
+// Answer 2: Undo or Backspace removes the last point while drawing.
+function zoneUndo() {
+  if (!_ze || _ze.drawing === null) return;
+  const z = _ze.zones[_ze.drawing];
+  z.points.pop();
+  if (!z.points.length) { _ze.zones.splice(_ze.drawing, 1); _ze.sel = _ze.drawing = null; }
+  _ze.dirty = true;
+  _zoneDraw(); _zoneList();
+}
+
+// Requirement 4 (double click) and answer 3 (Finish): stop drawing; the
+// lines stay, as an open zone that does not detect.
+function zoneFinish(fromDblClick) {
+  if (!_ze || _ze.drawing === null) return;
+  const z = _ze.zones[_ze.drawing];
+  if (fromDblClick && z.points.length >= 2) {
+    const a = z.points[z.points.length - 1], b = z.points[z.points.length - 2];
+    if (Math.abs(a[0] - b[0]) < 0.005 && Math.abs(a[1] - b[1]) < 0.005) z.points.pop();
+  }
+  if (z.points.length < 2) {                     // nothing drawn yet: no zone
+    _ze.zones.splice(_ze.drawing, 1);
+    _ze.sel = _ze.drawing = null;
+    _zoneDraw(); _zoneList();
+    return;
+  }
+  _ze.drawing = null;
+  _zoneDraw(); _zoneList();
+  _zoneHint('Drawing stopped. The zone is open and does not detect; click to go on drawing it.');
+}
+
+function zoneCloseShape() { if (_ze && _ze.drawing !== null) _zoneClose(_ze.drawing); }
+
+function zoneNew() {
+  if (!_ze) return;
+  if (_ze.zones.length >= ZONE_MAX) return;
+  _ze.drawing = null;
+  _ze.sel = null;
+  _zoneHint('Click on the picture to set the first point of the new zone.');
+}
+
+// Answer 18: points are easier to place on a still picture.
+function zonePause() {
+  if (!_ze) return;
+  const btn = document.getElementById('zone-pause');
+  const still = document.getElementById('zone-still');
+  if (_ze.paused) {
+    _ze.paused = false;
+    still.style.display = 'none';
+    btn.textContent = 'Pause';
+    const v = _go2rtc && _go2rtc.el && _go2rtc.el.video;
+    if (v && v.paused) v.play();
+    _zoneLayout();
+    return;
+  }
+  const m = _zoneMedia();
+  try {
+    still.width = m.w; still.height = m.h;
+    still.getContext('2d').drawImage(m.el, 0, 0, m.w, m.h);
+  } catch (e) { _zoneHint('This picture cannot be paused.', true); return; }
+  if (m.el.tagName === 'VIDEO') m.el.pause();
+  _ze.paused = true;
+  btn.textContent = 'Resume';
+  _zoneLayout();
+  still.style.display = 'block';
+}
+
+function zoneOnlyChange() {
+  if (!_ze) return;
+  _ze.zonesOnly = document.getElementById('zone-only').checked;
+  _ze.dirty = true;
+}
+
+function zoneRename(i, v) { if (_ze && _ze.zones[i]) { _ze.zones[i].name = v.slice(0, 40); _ze.dirty = true; _zoneDraw(); } }
+
+function zoneLevel(i, v) {
+  if (!_ze || !_ze.zones[i]) return;
+  _ze.zones[i].level = parseInt(v, 10) || 0;
+  _ze.dirty = true;
+  const lab = document.querySelector('#zone-list [data-zlev="' + i + '"]');
+  if (lab) lab.textContent = _ze.zones[i].level ? _ze.zones[i].level : 'Off';
+}
+
+function zoneDelete(i, btn) {
+  if (!_ze || !_ze.zones[i]) return;
+  if (!btn.dataset.armed) {          // answer 2: delete asks to confirm
+    btn.dataset.armed = '1';
+    btn.textContent = 'Delete?';
+    setTimeout(() => { delete btn.dataset.armed; btn.textContent = 'Delete'; }, 3000);
+    return;
+  }
+  _ze.zones.splice(i, 1);
+  _ze.sel = _ze.drawing = null;
+  _ze.dirty = true;
+  _zoneDraw(); _zoneList();
+}
+
+function zoneSelect(i) { if (_ze) { _ze.sel = i; _zoneDraw(); _zoneList(); } }
+
+// Keys while the drawing window is open. True when the key was used.
+function zoneKey(e) {
+  if (!_ze) return false;
+  const typing = e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName || '');
+  if (e.key === 'Escape') {          // answer 23: stops drawing, never closes the window
+    if (_ze.drawing !== null) zoneFinish(false);
+    return true;
+  }
+  if (typing) return false;
+  if (e.key === 'Enter') { zoneCloseShape(); return true; }
+  if (e.key === 'Backspace') { e.preventDefault(); zoneUndo(); return true; }
+  return false;
+}
+
+/* ── drawing the outlines ───────────────────────────────────────────────── */
+function _zoneLayout() {
+  const svg = document.getElementById('zone-svg');
+  const r = _zoneRect();
+  for (const el of [svg, document.getElementById('zone-still')]) {
+    el.style.left = r.left + 'px'; el.style.top = r.top + 'px';
+    el.style.width = r.width + 'px'; el.style.height = r.height + 'px';
+  }
+  svg.setAttribute('viewBox', '0 0 ' + r.width + ' ' + r.height);
+  if (_ze) _ze.rect = r;
+  _zoneDraw();
+}
+
+function _zoneSvg(zones, opt) {
+  const r = opt.rect, W = r.width, H = r.height;
+  const xy = p => (p[0] * W).toFixed(1) + ',' + (p[1] * H).toFixed(1);
+  let out = '';
+  zones.forEach((z, i) => {
+    if (!z.points.length) return;
+    const sel = opt.sel === i, rec = opt.recZone && opt.recZone === z.name;
+    const cls = 'zone-shape' + (sel ? ' zone-sel' : '') + (z.level ? '' : ' zone-off')
+              + (z.closed ? '' : ' zone-open') + (rec ? ' zone-rec' : '');
+    const pts = z.points.map(xy).join(' ');
+    out += z.closed
+      ? '<polygon class="' + cls + '" data-z="' + i + '" points="' + pts + '"/>'
+      : '<polyline class="' + cls + '" data-z="' + i + '" points="' + pts + '"/>';
+    const c = z.points.reduce((a, p) => [a[0] + p[0] / z.points.length, a[1] + p[1] / z.points.length], [0, 0]);
+    out += '<text class="zone-label" x="' + (c[0] * W).toFixed(1) + '" y="' + (c[1] * H).toFixed(1) + '">'
+         + esc(z.name) + (rec ? ' ● REC' : '') + (z.level ? '' : ' (off)') + '</text>';
+    if (!opt.edit || !sel) return;
+    const n = z.points.length, last = z.closed ? n : n - 1;
+    for (let k = 0; k < last; k++) {                 // middle handles: drag to add a point
+      const a = z.points[k], b = z.points[(k + 1) % n];
+      out += '<circle class="zone-mid" data-z="' + i + '" data-m="' + k + '" r="5" cx="'
+           + ((a[0] + b[0]) / 2 * W).toFixed(1) + '" cy="' + ((a[1] + b[1]) / 2 * H).toFixed(1) + '"/>';
+    }
+    z.points.forEach((p, k) => {
+      const first = k === 0 && opt.drawing === i;
+      const near = first && opt.cursor && z.points.length >= 3
+        && Math.hypot((opt.cursor[0] - p[0]) * W, (opt.cursor[1] - p[1]) * H) <= ZONE_SNAP_PX;
+      out += '<circle class="zone-pt' + (first ? ' zone-first' : '') + (near ? ' zone-near' : '')
+           + '" data-z="' + i + '" data-p="' + k + '" r="' + (first ? 9 : 6) + '" cx="'
+           + (p[0] * W).toFixed(1) + '" cy="' + (p[1] * H).toFixed(1) + '"/>';
+    });
+    if (opt.drawing === i && opt.cursor) {            // the line follows the pointer
+      const a = z.points[z.points.length - 1];
+      out += '<line class="zone-rubber" x1="' + (a[0] * W).toFixed(1) + '" y1="' + (a[1] * H).toFixed(1)
+           + '" x2="' + (opt.cursor[0] * W).toFixed(1) + '" y2="' + (opt.cursor[1] * H).toFixed(1) + '"/>';
+    }
+  });
+  return out;
+}
+
+function _zoneDraw() {
+  const svg = document.getElementById('zone-svg');
+  if (_ze) {
+    svg.innerHTML = _zoneSvg(_ze.zones, {edit: true, rect: _ze.rect || _zoneRect(), sel: _ze.sel,
+                                         drawing: _ze.drawing, cursor: _ze.cursor});
+  } else if (_zoneShow && _zoneShow.camId === _focusCamId) {
+    svg.innerHTML = _zoneSvg(_zoneShow.zones, {edit: false, rect: _zoneRect(),
+                                               recZone: _recZone[_zoneShow.camId]});
+  }
+}
+
+function _zoneHint(text, bad) {
+  const h = document.getElementById('zone-hint');
+  h.textContent = text;
+  h.classList.toggle('zone-bad', !!bad);
+}
+
+function _zoneList() {
+  if (!_ze) return;
+  const list = document.getElementById('zone-list');
+  list.innerHTML = _ze.zones.map((z, i) => {
+    let note = '';
+    if (!z.closed) note = 'Open: does not detect until the shape is closed.';
+    else if (_zoneSelfCrossing(z.points)) note = 'Two lines cross: move a point.';
+    else {
+      const cells = _zoneCells(z.points);
+      if (cells < ZONE_MIN_CELLS) note = 'Small: ' + cells + ' cells. Detection may be unreliable.';
+    }
+    return '<div class="zl-row' + (_ze.sel === i ? ' zl-sel' : '') + '" onclick="zoneSelect(' + i + ')">'
+      + '<input class="zl-name" data-zname="' + i + '" maxlength="40" value="' + esc(z.name) + '"'
+      + ' onclick="event.stopPropagation()" oninput="zoneRename(' + i + ',this.value)">'
+      + '<div class="zl-lev"><input type="range" min="0" max="100" value="' + z.level + '"'
+      + ' onclick="event.stopPropagation()" oninput="zoneLevel(' + i + ',this.value)">'
+      + '<span data-zlev="' + i + '">' + (z.level ? z.level : 'Off') + '</span></div>'
+      + '<button class="btn btn-ghost btn-sm zl-del" onclick="event.stopPropagation();zoneDelete(' + i + ',this)">Delete</button>'
+      + (note ? '<div class="zl-note">' + esc(note) + '</div>' : '')
+      + '</div>';
+  }).join('') || '<div class="zl-empty">No zones yet. Click on the picture to start one.</div>';
+  document.getElementById('zone-new').disabled = _ze.zones.length >= ZONE_MAX;
+  const drawing = _ze.drawing !== null;
+  document.getElementById('zone-undo').disabled = !drawing;
+  document.getElementById('zone-finish').disabled = !drawing;
+  document.getElementById('zone-close').disabled = !(drawing && _ze.zones[_ze.drawing].points.length >= 3);
+  if (!document.getElementById('zone-hint').textContent) {
+    _zoneHint('Click to set points; click the first point (or press Enter) to close the shape. '
+            + 'Right-click or long-press a point to remove it.');
+  }
+}
+
+/* ── "Show zones" in Enhanced View (answer 16) ──────────────────────────── */
+async function zoneShowToggle() {
+  const on = document.getElementById('focus-zone-show').checked;
+  if (!on || !_focusCamId) { _zoneShowOff(); return; }
+  const camId = _focusCamId;
+  try {
+    const d = await (await fetch(BASE + '/api/cameras/' + encodeURIComponent(camId) + '/motion/zones')).json();
+    if (camId !== _focusCamId || _ze) return;
+    _zoneShow = {camId, zones: (d.zones || []).filter(z => z.closed)};
+    if (d.recording_zone) _recZone[camId] = d.recording_zone;
+  } catch (e) { return; }
+  const svg = document.getElementById('zone-svg');
+  svg.style.display = 'block';
+  _zoneLayout();
+}
+
+function _zoneShowOff() {
+  _zoneShow = null;
+  if (_ze) return;
+  const svg = document.getElementById('zone-svg');
+  svg.style.display = 'none';
+  svg.innerHTML = '';
+}
+
+window.addEventListener('resize', () => { if (_ze || _zoneShow) _zoneLayout(); });
 
 /* ── Storage browser ─────────────────────────────────────────────────────── */
 let _storageData    = null;
@@ -1791,9 +2799,106 @@ function renderGrid() {
     if (!seenKeys.has(k)) c.remove();
   });
 
+  _cardOrderApply(grid);
   grid.querySelectorAll('video[data-hls]').forEach(v => { if (!v._hls) initHls(v); });
   initSnaps();   // start polling for any newly added data-snap images
   cardLivePrune();
+}
+
+/* ── 3.1.0 (D3): drag a card to move it; one order for every viewer ───────
+ * The add-on saves the order (/api/card_order) and sends the cameras in
+ * it, so every viewer sees the same order at the next load. The drag uses
+ * pointer events, which work with a mouse and with a finger. The card
+ * moves once, when it is dropped: moving a card restarts its live stream.
+ */
+function _cardOrderApply(grid) {
+  const want = cameras.map(_stableCardKey);
+  const cards = [...grid.querySelectorAll('.camera-card')];
+  const have = cards.map(c => c.dataset.stableKey);
+  if (want.join('\n') === have.join('\n')) return;
+  const byKey = new Map(cards.map(c => [c.dataset.stableKey, c]));
+  want.forEach(k => { const c = byKey.get(k); if (c) grid.appendChild(c); });
+}
+
+let _cardDrag = null;   // {card, target, after}
+
+function cardDragStart(ev, handle) {
+  const card = handle.closest('.camera-card');
+  if (!card || (ev.button !== undefined && ev.button !== 0)) return;
+  ev.preventDefault();
+  _cardDrag = {card, target: null, after: false};
+  card.classList.add('drag-src');
+  try { handle.setPointerCapture(ev.pointerId); } catch (e) {}
+  handle.onpointermove = _cardDragMove;
+  handle.onpointerup = handle.onpointercancel = e => _cardDragEnd(e, handle);
+}
+
+// 3.7.0-rc2.0 (D4): a line in the gap between two cards shows where the
+// card lands, like a text cursor. Cards side by side get an upright line;
+// cards stacked in one column (a phone held upright) get a level line.
+function _cardStacked(target) {
+  const grid = target.parentNode;
+  const g = grid && grid.getBoundingClientRect ? grid.getBoundingClientRect() : null;
+  return !!(g && target.getBoundingClientRect().width > g.width * 0.6);
+}
+
+function _cardDragMark(target, after) {
+  const line = document.getElementById('card-drop-line');
+  if (!line) return;
+  if (!target) { line.style.display = 'none'; return; }
+  const r = target.getBoundingClientRect();
+  const cs = (typeof getComputedStyle === 'function' && target.parentNode)
+    ? getComputedStyle(target.parentNode) : null;
+  const gap = parseFloat(cs && (cs.columnGap || cs.gap)) || 16;
+  if (_cardStacked(target)) {
+    const y = after ? r.top + r.height + gap / 2 : r.top - gap / 2;
+    Object.assign(line.style, {display: 'block', left: r.left + 'px', top: (y - 2) + 'px',
+                               width: r.width + 'px', height: '4px'});
+  } else {
+    const x = after ? r.left + r.width + gap / 2 : r.left - gap / 2;
+    Object.assign(line.style, {display: 'block', left: (x - 2) + 'px', top: r.top + 'px',
+                               width: '4px', height: r.height + 'px'});
+  }
+}
+
+function _cardDragMove(ev) {
+  if (!_cardDrag) return;
+  const under = document.elementFromPoint(ev.clientX, ev.clientY);
+  const target = under && under.closest('.camera-card');
+  if (!target || target === _cardDrag.card) { _cardDrag.target = null; _cardDragMark(null); return; }
+  const r = target.getBoundingClientRect();
+  _cardDrag.target = target;
+  _cardDrag.after = _cardStacked(target) ? ev.clientY > r.top + r.height / 2
+                                         : ev.clientX > r.left + r.width / 2;
+  _cardDragMark(target, _cardDrag.after);
+}
+
+function _cardDragEnd(ev, handle) {
+  const d = _cardDrag;
+  _cardDrag = null;
+  handle.onpointermove = handle.onpointerup = handle.onpointercancel = null;
+  _cardDragMark(null);
+  if (!d) return;
+  d.card.classList.remove('drag-src');
+  if (ev.type !== 'pointerup' || !d.target) return;
+  d.target.parentNode.insertBefore(d.card, d.after ? d.target.nextSibling : d.target);
+  cardOrderSave();
+}
+
+// Send the order on screen to the add-on, and keep `cameras` in it, so the
+// next renderGrid does not move the cards back.
+async function cardOrderSave() {
+  const grid = document.getElementById('cam-grid');
+  const keys = [...grid.querySelectorAll('.camera-card')].map(c => c.dataset.stableKey).filter(Boolean);
+  const rank = new Map(keys.map((k, i) => [k, i]));
+  cameras.sort((a, b) => (rank.get(_stableCardKey(a)) ?? 1e9) - (rank.get(_stableCardKey(b)) ?? 1e9));
+  try {
+    const r = await fetch(BASE + '/api/card_order', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({order: keys}),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) { showToast('The card order could not be saved', true); }
 }
 
 function buildCard(cam) {
@@ -1867,15 +2972,18 @@ function feedHTML(cam) {
   if (d === 'hls' && cam.status === 'ready')
     return '<video data-hls="' + esc(cam.stream_url) + '" autoplay muted playsinline></video>';
 
-  if (d === 'webrtc')
-    return '<div class="info-overlay"><div class="pi">🔗</div><strong>WebRTC Detected</strong>'
-         + '<p>' + esc(cam.info || '') + '</p>'
-         + '<a href="' + esc(cam.signaling_url || '#') + '" target="_blank">Open endpoint ↗</a></div>';
+  // 3.2.0 (C6): go2rtc plays a WebRTC (WHEP) or RTSP-over-WebSocket camera
+  // live. No still pictures exist for it: data-nosnap stops the fallback.
+  if (d === 'webrtc' || d === 'wsrtsp')
+    return '<img class="live" data-snap="' + esc(cam.id) + '" data-nosnap="1" alt="Live" style="display:none">'
+         + '<div class="feed-placeholder" id="ph-' + esc(cam.id) + '">'
+         + '<span>' + (d === 'webrtc' ? 'WebRTC camera' : 'RTSP over WebSocket camera')
+         + ' — starting live view…</span></div>';
 
-  if (d === 'wsrtsp')
-    return '<div class="info-overlay"><div class="pi">🔌</div><strong>WS-RTSP Detected</strong>'
-         + '<p>' + esc(cam.info || '') + '</p>'
-         + '<code>' + esc(cam.ws_url || '') + '</code></div>';
+  // 3.0.1 (B2): a camera built into an appliance, found by its MAC address
+  if (d === 'appliance')
+    return '<div class="info-overlay"><div class="pi">📷</div><strong>Camera in an appliance</strong>'
+         + '<p>' + esc(cam.info || '') + '</p></div>';
 
   if (cam.verdict === 'uncertain' || cam.verdict === 'not_camera')
     return '<div class="feed-placeholder">'
@@ -2200,6 +3308,9 @@ function cardHTML(cam) {
 
   return '<div class="feed-wrap">' + feedHTML(cam) + '</div>'
     + '<div class="card-info">'
+    // 3.1.0 (D3): drag here to move the card
+    + '<span class="card-drag" title="Drag to move this card" aria-label="Move card"'
+    + ' onpointerdown="cardDragStart(event,this)">⠿</span>'
     + '<div class="status-dot ' + dotClass(cam) + '"></div>'
     + '<span class="card-name" title="' + name + '"'
     + ' onclick="openRename(' + jsArg(cam.id) + ',' + jsArg(displayName(cam)) + ')">'
