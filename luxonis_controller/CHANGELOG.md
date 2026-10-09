@@ -13,6 +13,21 @@
 | PoE | Power over Ethernet |
 | RTSP | Real Time Streaming Protocol, the video stream on port 8765 |
 
+## 3.1.1
+Removes the last OAK-D LR naming, including the App store heading.
+
+### Changes & improvements
+- **Every release now carries an add-on zip for drag and drop.** Unzip it into `/addons`, reload the add-on store, and install from Local apps. It is only the manifest, because the add-on installs a prebuilt image.
+- **The App store section now reads "Luxonis Controller".** It comes from `repository.yaml`, which 3.1.0 missed.
+- **The release Install section now has three parts:** Windows portable, Home Assistant via HA Repository, and Home Assistant manual sideload. The repository badge points at the add-on store repository.
+- **Log messages, the Home Assistant example config and both READMEs name the project, not one camera model.**
+
+### Bugs fixed
+- None. This release changes names only.
+
+### Known issues
+- **The Windows build is not signed.** SmartScreen warns on first run. Avoid it by right-clicking the downloaded zip, Properties, tick Unblock, then extract. Windows copies the Mark of the Web from the zip onto every file inside it.
+
 ## 3.1.0
 Renames everything to Luxonis Controller, and adds a settings backup you can restore.
 
