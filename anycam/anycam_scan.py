@@ -672,7 +672,7 @@ async def run_port_scan(ip: str) -> None:
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
 
-            # "Discovered open port 554/tcp on 192.168.1.3"
+            # "Discovered open port 554/tcp on 192.168.50.3"
             m_port = re.search(r"Discovered open port (\d+)/(\w+)", line)
             if m_port:
                 port_num = int(m_port.group(1))
