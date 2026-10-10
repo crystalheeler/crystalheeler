@@ -23,7 +23,7 @@ Live view that recovers by itself, a Quality Switch for 4K cameras, calmer handl
 
 ### Known issues
 
-- **The Microseven needs one power cycle** before its live view can be tested.
+- **Live view is untested on an unlocked Microseven camera.**
 - **Other programs on the Pi can read camera video** through go2rtc's local RTSP server.
 - **One Amcrest camera can get two cards** (under investigation).
 
@@ -44,7 +44,7 @@ A release candidate that stops AnyCam's own start-up checks from upsetting fragi
 
 ### Known issues
 
-- **The Microseven needs one power cycle** to leave its stuck state before the ffmpeg copy can be tested.
+- **The ffmpeg copy is untested on an unlocked Microseven camera.**
 - **Other programs on the Pi can read camera video** through go2rtc's local RTSP server.
 - **One Amcrest camera can get two cards** (under investigation).
 
@@ -2387,11 +2387,11 @@ CrystalHeeler's 2.5.0-rc1.8 test log shows the leak in two places:
 - After credentials accepted on the Lorex, the `validate_rtsp_walk
   db_probe` lines logged the full creds-bearing URL when validating
   the sub-stream:
-  `validating rtsp://admin:poopytoot69!@192.168.50.217:554/...`
+  `validating rtsp://admin:examplepass@192.168.50.217:554/...`
 - The follow-up `validate_rtsp_walk channel-enum` walk for each of
   the 15 other channels logged the URL-encoded form (URL constructed
   via `quote()` for the channel-enum helper):
-  `validating rtsp://admin:poopytoot69%21@192.168.50.217:554/...`
+  `validating rtsp://admin:examplepass@192.168.50.217:554/...`
 
 Both forms exposed creds. URL-encoding doesn't help — `%21` is just
 the `!` character percent-encoded, trivially reversible.
@@ -8395,7 +8395,7 @@ Best-practice audit (required on this release):
   running=False with an error message so the UI never gets permanently stuck
 - Stage label removed from status message text — stage is shown only in the
   purple badge; message now shows just what is happening (e.g. 'Probing
-  192.168.1.3 (1/4)...') without the 'Stage 3/4 —' prefix duplication
+  192.168.50.3 (1/4)...') without the 'Stage 3/4 —' prefix duplication
 - Scan timer changed from elapsed to ETA countdown:
   Early stages show 'X:XX elapsed'; once Stage 3 begins, an ETA is calculated
   by extrapolating from Stage 1+2 time (25% of work) to 100% and showing
@@ -8541,7 +8541,7 @@ cameras on very non-standard ports. Adds 5-20 minutes depending on silent hosts.
 - _probe_host_port() now calls probe_http_identity() on HTTP ports and attaches identity
   fields (manufacturer, device_notes, page_title, server_header) to every camera dict
 - Camera display name auto-upgraded: if manufacturer is identified and the name is still
-  the IP-derived default, the name is set to "Manufacturer (ip)" (e.g. "Lorex (192.168.1.3)")
+  the IP-derived default, the name is set to "Manufacturer (ip)" (e.g. "Lorex (192.168.50.3)")
 - ONVIF-only devices (detected by multicast but not port scan) now also get HTTP identity
   probing on ports 80, 8080, 443
 - Identity section on each camera card: collapsible "🔍 Identity" section showing
