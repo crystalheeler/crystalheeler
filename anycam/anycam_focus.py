@@ -24,7 +24,7 @@ log = logging.getLogger("anycam")
 NEEDS = (
     'CAMERAS', '_FOCUS_ADAPTIVE', '_MOTION', '_SNAP',
     '_snap_last_access', '_snap_state', 'build_authenticated_url',
-    'snap_loop',
+    'save_cameras', 'snap_loop',
 )
 
 # Currently focused camera for full-screen enhanced view.
@@ -57,6 +57,8 @@ async def api_go2rtc_focus(request: web.Request) -> web.Response:
     except ValueError:
         return web.json_response({"ok": False, "reason": "bad profile index"},
                                  status=400)
+    if anycam_go2rtc._rtsp_stuck(camera_id):    # 3.7.4 (B6, B32): no RTSP to it
+        return web.json_response({"ok": False, "reason": anycam_go2rtc.RTSP_STUCK_REASON})
     src, codec, reason = _go2rtc_profile_source(camera, prof_idx)
     if not src:
         return web.json_response({"ok": False, "reason": reason, "codec": codec})
@@ -178,6 +180,9 @@ async def handle_focus_set(request: web.Request) -> web.Response:
     # HW; rc2.4 was giving them a stale counter. Resetting here makes
     # "this session" actually mean what the log says: one focus entry.
     if state:
+        # 3.7.5-rc1.0 (B51): the keyframes-only and sub-stream decisions are per session
+        state.pop("classic_keyframes", None)
+        state.pop("smooth_failed", None)
         if state.pop("hw_session_fails", None) or state.pop("hw_session_skip", None):
             log.debug(f"Focus: cleared HW session counters for {camera_id} "
                       f"— fresh shot at hardware decode")
@@ -204,9 +209,48 @@ async def handle_focus_set(request: web.Request) -> web.Response:
         # buffer (X-Focus-Frames). The cancelled task cannot add to
         # frame_count: it stops at its next await.
         state["focus_frame_base"] = state.get("frame_count", 0)
+        # 3.7.2 (B36): a live card asks for no pictures, so the last request
+        # can be minutes old; the new loop's idle check then stopped it at
+        # once ("idle 664s — stopping") and the view sat on "Loading".
+        _snap_last_access[camera_id] = time.monotonic()
         state["task"] = asyncio.create_task(
             snap_loop(camera_id, url, camera, native_res=True))
     return web.json_response({"status": "ok", "focused": camera_id})
+
+
+async def api_quality_switch(request: web.Request) -> web.Response:
+    """POST /api/cameras/{camera_id}/quality_switch  body: {"smooth": bool} (3.7.5-rc1.0, B51).
+
+    Smooth: the classic view plays the camera's sub-stream, smaller but at
+    its full rate. Off: full size, keyframes only when the Pi falls behind.
+    Saved per camera. A running classic view restarts in the new mode.
+    """
+    camera_id = request.match_info["camera_id"]
+    camera = CAMERAS.get(camera_id)
+    if not camera:
+        return web.json_response({"error": "Camera not found"}, status=404)
+    try:
+        smooth = bool((await request.json()).get("smooth"))
+    except (ValueError, AttributeError):
+        return web.json_response({"error": "JSON body required"}, status=400)
+    if smooth and not anycam_go2rtc._classic_sub_stream(camera):
+        return web.json_response({"error": "this camera has no sub-stream"}, status=400)
+    camera["classic_smooth"] = smooth
+    save_cameras()
+    log.info(f"Focus: Quality Switch {'on (sub-stream)' if smooth else 'off (full size)'} for {camera_id}")
+    if _FOCUSED_CAMERA == camera_id and _FOCUS_ENGINE == "legacy":
+        state = _snap_state(camera_id)
+        state.pop("smooth_failed", None)
+        state.pop("classic_keyframes", None)
+        task = state.get("task")
+        if task and not task.done():
+            task.cancel()
+        url = build_authenticated_url(camera, url_key="stream_url")
+        if url:
+            state["focus_frame_base"] = state.get("frame_count", 0)
+            _snap_last_access[camera_id] = time.monotonic()
+            state["task"] = asyncio.create_task(snap_loop(camera_id, url, camera, native_res=True))
+    return web.json_response({"ok": True, "smooth": smooth})
 
 
 async def handle_focus_clear(request: web.Request) -> web.Response:

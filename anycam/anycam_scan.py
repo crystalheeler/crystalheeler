@@ -9,6 +9,7 @@ value at the moment of use.
 """
 import asyncio
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -45,6 +46,7 @@ NEEDS = (
     '_matches_feedback_fingerprint', '_publish_scan_card', '_strip_creds', '_throttle_wait_if_needed',
     'build_authenticated_url', 'decrypt_creds', 'encrypt_creds', 'load_runtime',
     'probe_stream_details', 'save_cameras', 'save_runtime',
+    'REMOVED_CAMERAS', 'save_removed',
 )
 # 2.4.0-rc2.6: Pending-flush card creation buffer. During a scan, new
 # cards discovered are routed here instead of CAMERAS so they don't
@@ -61,19 +63,47 @@ ARP_HOSTS: list[dict] = []   # [{ip, hostname}, ...]
 
 
 def get_local_subnet() -> str:
+    """The network to scan, from the default route's interface.
+
+    3.7.1 (B34): the route command is tried twice (5 s, then 15 s). If it
+    still gives nothing, the add-on's own address with a /24 mask is used.
+    Before, AnyCam fell back to a fixed 192.168.1.0/24 and scanned a
+    network the cameras were not on (2026-10-06, test system C). An empty
+    string means the network is unknown; the scan stops and says so.
+    """
+    for timeout in (5, 15):
+        try:
+            r = subprocess.run(["ip", "route", "show", "default"],
+                               capture_output=True, text=True, timeout=timeout)
+            m = re.search(r"dev\s+(\S+)", r.stdout)
+            if m:
+                r2 = subprocess.run(["ip", "addr", "show", m.group(1)],
+                                    capture_output=True, text=True, timeout=timeout)
+                m2 = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", r2.stdout)
+                if m2:
+                    return str(ipaddress.ip_interface(m2.group(1)).network)
+        except Exception as e:
+            log.warning(f"Subnet: {e}")
+    own = _own_ipv4()
+    if own:
+        net = str(ipaddress.ip_interface(f"{own}/24").network)
+        log.warning(f"Subnet: the route check gave no answer — scanning {net}, "
+                    f"from the add-on's own address {own}")
+        return net
+    log.error("Subnet: AnyCam could not find its network")
+    return ""
+
+
+def _own_ipv4() -> str | None:
+    """The address the add-on uses toward other networks; no packet is sent."""
+    import socket
     try:
-        r = subprocess.run(["ip", "route", "show", "default"],
-                           capture_output=True, text=True, timeout=5)
-        m = re.search(r"dev\s+(\S+)", r.stdout)
-        if m:
-            r2 = subprocess.run(["ip", "addr", "show", m.group(1)],
-                                capture_output=True, text=True, timeout=5)
-            m2 = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", r2.stdout)
-            if m2:
-                return str(ipaddress.ip_interface(m2.group(1)).network)
-    except Exception as e:
-        log.warning(f"Subnet: {e}")
-    return "192.168.1.0/24"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))        # TEST-NET-1: routing only, nothing sent
+            addr = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if addr.startswith(("127.", "0.")) else addr
 
 
 def get_default_gateway() -> str | None:
@@ -856,6 +886,40 @@ async def _rerun_onvif_auth(camera_id: str, camera: dict,
     return True
 
 
+# ── 3.7.5-rc2.0 (B53): no probing of cameras AnyCam already has ──────────
+# Both times the Microseven got stuck, AnyCam had just walked 28 RTSP paths
+# on it at start-up or rescan (2026-10-06 19:13, 2026-10-07 20:01). A scan
+# now leaves a host alone when a saved camera on that address has a working
+# stream, and gives a removed camera's card back from REMOVED_CAMERAS. For
+# every brand. Removing a card makes its camera scannable again.
+def _scan_known_camera(ip: str, saved: dict) -> dict | None:
+    """A saved camera on this address with a working stream, or None."""
+    for c in saved.values():
+        if (c.get("ip") == ip and c.get("stream_url")
+                and (c.get("credentials") or c.get("rtsp_probe_ok") or c.get("status") == "ready")):
+            return c
+    return None
+
+
+def _scan_restore_removed(ip: str, saved: dict) -> list[dict]:
+    """Give back the cards of removed cameras on this address, without probing."""
+    rem = [c for c in REMOVED_CAMERAS.values() if c.get("ip") == ip]
+    if not rem:
+        return []
+    if any(c.get("ip") == ip for c in saved.values()):
+        # The user set this camera up again; the old copy is not needed.
+        for c in rem:
+            REMOVED_CAMERAS.pop(c["id"], None)
+        save_removed()
+        return []
+    out = []
+    for c in rem:
+        card = json.loads(json.dumps(c))
+        _publish_scan_card(card)
+        out.append(card)
+    return out
+
+
 async def run_verification_scan(prev_version: str = "unknown") -> None:
     """
     Post-upgrade verification scan.
@@ -922,6 +986,10 @@ async def run_verification_scan(prev_version: str = "unknown") -> None:
         if proto in ("RTSP", "DVR", "ONVIF"):
             url = cam.get("stream_url","")
             if url:
+                # 3.7.5-rc2.0 (B53): inside the brand's cooldown, like every other
+                # connection (2026-10-07: 0 s after the ONVIF calls).
+                await _throttle_wait_if_needed(ip, _brand_throttle_seconds(cam),
+                                               f"verify {cam.get('name', ip)}")
                 found = await loop.run_in_executor(_THREAD_POOL, probe_rtsp, url, u, p)
                 # Populate codec info using authenticated URL if not yet stored
                 if not cam.get("stream_codec"):
@@ -1433,6 +1501,8 @@ async def run_scan() -> None:
 
     try:
         subnet  = await loop.run_in_executor(_THREAD_POOL, get_local_subnet)
+        if not subnet:      # 3.7.1 (B34): never guess a network
+            raise RuntimeError("AnyCam could not find its network; try the scan again")
         gateway = await loop.run_in_executor(_THREAD_POOL, get_default_gateway)
         log.info(f"Subnet: {subnet}  Gateway: {gateway}")
 
@@ -1528,6 +1598,17 @@ async def run_scan() -> None:
                 message=f"Stage 3/4 — Probing {ip} ({idx+1}/{len(nmap_results)})…")
 
             verdict, reason = classify_device(host)
+            # 3.7.5-rc2.0 (B53): a camera AnyCam already has is not probed
+            known = _scan_known_camera(ip, saved)
+            if known:
+                log.info(f"  {ip}: known camera '{known.get('name', ip)}' — not probed "
+                         f"(remove its card to scan it again)")
+                continue
+            restored = _scan_restore_removed(ip, saved)
+            if restored:
+                log.info(f"  {ip}: removed camera '{restored[0].get('name', ip)}' — card given back "
+                         f"from its kept details, not probed")
+                continue
             # 2.4.0-rc2.4: port-ordering optimization. Probe canonical
             # RTSP ports (554, 8554, 10554) FIRST — if any of them
             # establishes RTSP-speaker status (returns RTSP-format
@@ -1748,6 +1829,8 @@ async def run_scan() -> None:
                     break
                 ip, hostname = host["ip"], host.get("hostname", host["ip"])
                 verdict, reason = classify_device(host)
+                if _scan_known_camera(ip, saved) or _scan_restore_removed(ip, saved):
+                    continue            # 3.7.5-rc2.0 (B53)
                 for port_info in host.get("open_ports", []):
                     port = port_info["port"]
                     cid  = f"{ip}_{port}"
@@ -1823,6 +1906,8 @@ async def run_scan() -> None:
             _all_cams = list(CAMERAS.values()) + list(
                 (PENDING_CAMERAS or {}).values())
             existing = [c for c in _all_cams if c["ip"] == ip]
+            if not existing and _scan_restore_removed(ip, saved):
+                continue            # 3.7.5-rc2.0 (B53): given back, not probed
             if existing:
                 for cam in existing:
                     cam["onvif"]  = True
