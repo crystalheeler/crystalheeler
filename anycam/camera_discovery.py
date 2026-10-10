@@ -52,7 +52,7 @@ from anycam_motion import (
 import anycam_go2rtc
 from anycam_go2rtc import (
     _go2rtc_profile_source, _go2rtc_register, _go2rtc_stream_name, _go2rtc_supervisor,
-    api_go2rtc_card, handle_go2rtc_player_js, handle_go2rtc_ws,
+    api_go2rtc_card, api_live_fail, api_live_repair, handle_go2rtc_player_js, handle_go2rtc_ws,
 )
 # 3.0.0-rc1.3 (E1): anycam_probe.
 import anycam_probe
@@ -81,12 +81,12 @@ from anycam_page import (
 # 3.0.0-rc1.5 (E1): anycam_focus.
 import anycam_focus
 from anycam_focus import (
-    api_go2rtc_focus, handle_focus_clear, handle_focus_set,
+    api_go2rtc_focus, api_quality_switch, handle_focus_clear, handle_focus_set,
 )
 # 3.0.0-rc1.5 (E1): anycam_snap.
 import anycam_snap
 from anycam_snap import (
-    _drain_stderr, _stop_proc, api_logs,
+    _drain_stderr, _stop_proc, api_diagnostics_hwtest, api_logs,
     handle_snap_status, handle_snapshot, snap_loop,
 )
 # 3.0.0-rc1.5 (E1): anycam_credentials.
@@ -207,6 +207,7 @@ BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 RUNTIME_FILE   = DATA_DIR / "runtime.json"
 OUI_CACHE_FILE  = DATA_DIR / "oui_cache.json"
 FEEDBACK_FILE   = DATA_DIR / "not_camera_feedback.json"
+REMOVED_FILE    = DATA_DIR / "removed_cameras.json"   # 3.7.5-rc2.0 (B53)
 
 # IEEE OUI CSV download URL (official source, ~37k entries, refreshed periodically)
 OUI_CSV_URL      = "https://standards-oui.ieee.org/oui/oui.csv"
@@ -217,7 +218,7 @@ OUI_MAX_AGE_DAYS = 30  # re-download once a month
 # fingerprints will be submitted automatically.
 COMMUNITY_ENDPOINT = os.environ.get("ANYCAM_COMMUNITY_URL", "")
 
-CURRENT_VERSION = "3.7.0"  # must match config.yaml
+CURRENT_VERSION = "3.7.5"  # must match config.yaml
 
 INGRESS_PATH = os.environ.get("INGRESS_PATH", "").rstrip("/")
 PORT         = int(os.environ.get("INGRESS_PORT", 8099))
@@ -320,6 +321,16 @@ _HW_DECODER_CANDIDATES: list[tuple[str, str, list[str]]] = [
     ("hevc_vaapi",   "hevc", ["-hwaccel", "vaapi", "-c:v", "hevc"]),
     ("h264_vaapi",   "h264", ["-hwaccel", "vaapi", "-c:v", "h264"]),
 ]
+# 3.7.4 (B37, CrystalHeeler's option A): candidates AnyCam never picks by
+# itself. hevc_drm gave a green picture ("Decode fail", "Error parsing NAL
+# unit") for every camera and size tried on both test systems in October
+# 2026: 3840x2160, 2560x1440 and 704x480, with 127 to 211 MB of decoder
+# memory free. /api/diagnostics/hwtest/<camera> still runs it by hand, so a
+# later Home Assistant OS can be checked before it is used again.
+HW_NOT_AUTOMATIC: dict[str, str] = {
+    "hevc_drm": "the Pi's HEVC hardware decoder gives a green picture with this "
+                "kernel and ffmpeg (build plan B37); H.265 decodes in software",
+}
 
 # ── Shared thread pool for all run_in_executor calls ─────────────────────────
 # Using a named, bounded pool instead of None (default) gives us:
@@ -506,6 +517,10 @@ async def _throttle_wait_if_needed(ip: str, throttle_s: float,
 
 # IPs/cam-ids the user has explicitly dismissed (loaded from disk)
 BLACKLIST: set = set()
+# 3.7.5-rc2.0 (B53): cameras the user removed, kept without their password.
+# A later scan that finds the same address gives the card back from here
+# instead of probing the camera again (camera_id -> camera record).
+REMOVED_CAMERAS: dict = {}
 
 
 def _snap_state(camera_id: str) -> dict:
@@ -655,6 +670,39 @@ def _publish_scan_card(cam: dict) -> None:
         anycam_scan.PENDING_CAMERAS[cam["id"]] = cam
     else:
         CAMERAS[cam["id"]] = cam
+
+
+def load_removed() -> None:
+    """3.7.5-rc2.0 (B53): read the removed-cameras store."""
+    if not REMOVED_FILE.exists():
+        return
+    try:
+        REMOVED_CAMERAS.update({c["id"]: c for c in json.loads(REMOVED_FILE.read_text())})
+    except (ValueError, KeyError, TypeError, OSError) as e:
+        log.warning(f"Load removed cameras: {e}")
+
+
+def save_removed() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    REMOVED_FILE.write_text(json.dumps(list(REMOVED_CAMERAS.values()), indent=2))
+
+
+def _remember_removed(cam: dict) -> None:
+    """Keep a removed camera's details, without its password, for the next scan."""
+    keep = {k: v for k, v in cam.items()
+            if k not in ("credentials", "user_saved", "upgrade_missing", "upgrade_missing_version",
+                         "live_ffmpeg_copy", "classic_smooth")}
+    if keep.get("stream_url"):
+        keep["stream_url"] = _strip_creds(keep["stream_url"])
+    if keep.get("sub_stream_url"):
+        keep["sub_stream_url"] = _strip_creds(keep["sub_stream_url"])
+    for prof in keep.get("stream_profiles") or []:
+        if isinstance(prof, dict) and prof.get("url"):
+            prof["url"] = _strip_creds(prof["url"])
+    keep.update(status="needs_credentials", requires_credentials=True, credentials=None,
+                user_saved=False, remembered=True)
+    REMOVED_CAMERAS[keep["id"]] = keep
+    save_removed()
 
 
 def load_blacklist() -> None:
@@ -981,6 +1029,8 @@ def _safe_cam(cam: dict) -> dict:
     for f in ("stream_width", "stream_height"):
         s.setdefault(f, None)
     s.setdefault("stream_fps", None)
+    s["rtsp_stuck"] = anycam_go2rtc._rtsp_stuck(s.get("id", ""))   # 3.7.4 (B6, B32)
+    s["quality_switch"] = bool(anycam_go2rtc._classic_sub_stream(cam))   # 3.7.5-rc1.0 (B51)
     s.pop("credentials", None)
     return s
 
@@ -1093,8 +1143,14 @@ async def api_rename_camera(request: web.Request) -> web.Response:
 async def api_delete_camera(request: web.Request) -> web.Response:
 
     cid = request.match_info["camera_id"]
-    CAMERAS.pop(cid, None)
+    cam = CAMERAS.pop(cid, None)
     save_cameras()
+    # 3.7.5-rc2.0 (B53): the camera becomes scannable again; its details are
+    # kept (no password), so the next scan gives the card back without probing.
+    if cam and cam.get("ip"):
+        _remember_removed(json.loads(json.dumps(cam)))
+        log.info(f"Removed {cid}; its details are kept, so a scan brings the card back "
+                 f"without probing the camera")
     return web.json_response({"status": "ok"})
 
 async def api_confirm_camera(request: web.Request) -> web.Response:
@@ -1465,12 +1521,16 @@ def make_app() -> web.Application:
     # itself when go2rtc is not running.
     app.router.add_get(   "/api/go2rtc/focus/{camera_id}",        api_go2rtc_focus)
     app.router.add_get(   "/api/go2rtc/card/{camera_id}",         api_go2rtc_card)
+    app.router.add_post(  "/api/live_fail",                       api_live_fail)
+    app.router.add_post(  "/api/live_repair",                     api_live_repair)
+    app.router.add_post(  "/api/cameras/{camera_id}/quality_switch", api_quality_switch)
     app.router.add_get(   "/go2rtc/ws",                           handle_go2rtc_ws)
     app.router.add_get(   "/go2rtc/video-rtc.js",                 handle_go2rtc_player_js)
     app.router.add_post(  "/api/log_level",                        api_set_log_level)
     app.router.add_get(   "/api/logs",                            api_logs)
     app.router.add_get(   "/api/self",                            api_self)
     app.router.add_get(   "/api/diagnostics/hw",                  api_diagnostics_hw)
+    app.router.add_get(   "/api/diagnostics/hwtest/{camera_id}",  api_diagnostics_hwtest)
     app.router.add_route("*", "/api/card_order",                     api_card_order)
     app.router.add_route("*", "/api/upload/settings",                api_upload_settings)
     app.router.add_post(  "/api/upload/test",                        api_upload_test)
@@ -1557,7 +1617,9 @@ def _hw_device_report() -> dict:
     names = " ".join(d["name"].lower() for d in devices)
     report = {
         "devices": devices,
-        "rpivid": "rpivid" in names,                         # the HEVC decoder (C9)
+        # the HEVC decoder (C9). 3.7.1 (B11): newer Raspberry Pi kernels name
+        # it rpi-hevc-dec, not rpivid; 3.7.0 then warned of a missing overlay.
+        "rpivid": "rpivid" in names or "rpi-hevc-dec" in names,
         "bcm2835_codec": "bcm2835-codec-decode" in names,    # the H.264 decoder
         "blocked": [d["device"] for d in devices if d["opens"] != "yes"],
     }
@@ -1568,8 +1630,11 @@ def _hw_device_report() -> dict:
         notes.append("no rpivid HEVC decoder: on a Pi 4, add dtoverlay=rpivid-v4l2 to "
                      "/boot/firmware/config.txt and restart the Pi")
     if report["blocked"]:
+        # 3.7.1 (B11): confirmed 2026-10-06 on test system B: with the
+        # add-on's Protection mode off, every device opens.
         notes.append("the add-on may not open " + ", ".join(report["blocked"])
-                     + "; hardware decode on these falls back to software")
+                     + "; hardware decode on these falls back to software. To allow it, "
+                     "turn off Protection mode on AnyCam's Info page and restart AnyCam")
     report["notes"] = notes
     return report
 
@@ -1591,6 +1656,8 @@ async def api_diagnostics_hw(request: web.Request) -> web.Response:
         "unavailable": sorted(_HW_UNAVAILABLE),
         "candidates": [label for label, _c, _a in _HW_DECODER_CANDIDATES],
         "software_fallback": dict(anycam_snap._HW_FALLBACK),
+        "frozen_hardware": dict(anycam_snap._HW_FROZEN),          # 3.7.2 (B37)
+        "picture_tests": dict(anycam_snap._HW_TEST_RESULTS),
     })
 
 
@@ -1675,6 +1742,10 @@ async def _probe_hw_decoders() -> None:
     available: list[str] = []
     vaapi_state: tuple[bool, str] | None = None     # 3.0.1 (B12): tested once
     for label, codec, args in _HW_DECODER_CANDIDATES:
+        if label in HW_NOT_AUTOMATIC:
+            _HW_UNAVAILABLE.add(label)
+            log.info(f"  {label}: not used ({HW_NOT_AUTOMATIC[label]})")
+            continue
         is_hwaccel = "-hwaccel" in args
 
         if is_hwaccel:
@@ -1698,6 +1769,15 @@ async def _probe_hw_decoders() -> None:
             if hwaccel_name == "drm":
                 rpivid_loaded = (os.path.exists("/dev/video19")
                                  and os.path.exists("/dev/media0"))
+                # 3.7.1 (B11): present is not enough; the add-on must also
+                # be allowed to open them, or ffmpeg decodes in software.
+                blocked = [d for d in ("/dev/video19", "/dev/media0")
+                           if d in _HW_REPORT.get("blocked", [])]
+                if rpivid_loaded and blocked:
+                    _HW_UNAVAILABLE.add(label)
+                    log.info(f"  {label}: unavailable (the add-on may not open "
+                             f"{', '.join(blocked)}: Protection mode is on)")
+                    continue
                 if not rpivid_loaded:
                     _HW_UNAVAILABLE.add(label)
                     reason = ("rpivid not loaded — /dev/video19 or "
@@ -1942,6 +2022,7 @@ async def main() -> None:
 
     load_cameras()
     load_blacklist()
+    load_removed()          # 3.7.5-rc2.0 (B53)
     load_feedback()
     load_oui_db()   # Load cached OUI DB synchronously (fast, from disk)
 
@@ -1985,7 +2066,7 @@ async def main() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info(f"AnyCam on :{PORT}  ingress='{INGRESS_PATH}'")
+    log.info(f"AnyCam {CURRENT_VERSION} on :{PORT}  ingress='{INGRESS_PATH}'")   # 3.7.3 (B43)
 
     # ── Hardware decoder availability probe ───────────────────────────────────
     # Run once at startup. Checks which hw decoders ffmpeg was compiled with

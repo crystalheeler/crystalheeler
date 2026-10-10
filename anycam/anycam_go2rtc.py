@@ -19,14 +19,17 @@ import secrets
 import time
 from aiohttp import web
 from pathlib import Path
-from urllib.parse import urlparse, quote
+from urllib.parse import quote, unquote, urlparse, urlsplit
+
+from anycam_probe import _validate_rtsp_urls_single_socket   # 3.7.4 (B6)
 
 log = logging.getLogger("anycam")
 
 # Taken from camera_discovery.py at start-up (anycam_host.bind).
 NEEDS = (
     'CAMERAS', 'CARD_MAX_WIDTH', '_ANSI_ESCAPE_RE', '_THREAD_POOL',
-    '_brand_throttle_seconds', '_dahua_sub_stream', '_match_stream_db', '_mjpeg_source',
+    '_brand_throttle_seconds', '_dahua_sub_stream', '_identify_camera_brand',
+    '_match_stream_db', '_mjpeg_source', 'save_cameras',
     '_streams_refresh',
     '_strip_creds', '_throttle_wait_if_needed', 'build_authenticated_url',
 )
@@ -41,12 +44,23 @@ GO2RTC_API_HOST        = "127.0.0.1"
 GO2RTC_API_PORT        = 28984
 GO2RTC_WEBRTC_PORT     = 28555
 # 3.3.0 (C4): go2rtc's RTSP server, for AnyCam's own ffmpeg jobs. It listens
-# on 127.0.0.1 only and asks for a password that is new at each start, so
-# no other program on the Pi can read the cameras through it (approved by
-# CrystalHeeler, 2026-10-04).
+# on 127.0.0.1 only, with a password that is new at each start (approved by
+# CrystalHeeler, 2026-10-04). 3.7.4: go2rtc 1.9.14 does not ask programs on
+# 127.0.0.1 for that password (internal/rtsp: the check is skipped for a
+# loopback address), and this add-on uses the host's network, so other
+# programs on the Pi can read the video through it (build plan B48). The
+# ffmpeg copy of B47 relies on that skip to publish into go2rtc.
 GO2RTC_RTSP_PORT       = 28554
 GO2RTC_RTSP_USER       = "anycam"
 _GO2RTC_RTSP_PASS      = secrets.token_urlsafe(24)
+# 3.7.4 (B47): go2rtc's API asks every caller for a password that is new at
+# each start, programs on 127.0.0.1 included (local_auth). The API can add
+# stream sources, and with the ffmpeg module a source runs ffmpeg with its
+# own arguments inside this full_access add-on; without the password any
+# program on the Pi's network could do that, and read every camera's
+# address and password from /api/streams.
+GO2RTC_API_USER        = "anycam"
+_GO2RTC_API_PASS       = secrets.token_urlsafe(24)
 # A camera whose stream fails this many times in a row through go2rtc is
 # opened directly by ffmpeg again, as before 3.3.0, until the add-on restarts.
 RELAY_FAIL_LIMIT       = 3
@@ -71,8 +85,18 @@ def _go2rtc_config() -> str:
     load-bearing; see the security model above.
     """
     return json.dumps({
-        "app":    {"modules": ["api", "ws", "rtsp", "webrtc", "mp4"]},
-        "api":    {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_API_PORT}"},
+        # 3.7.4 (B47): ffmpeg, for the copy source of _go2rtc_camera_src.
+        # 3.7.5-rc1.0 (B49): and exec, which go2rtc runs every ffmpeg: source
+        # through ("unsupported scheme: exec:ffmpeg ..." without it, test
+        # system A, 2026-10-07). exec can run any command as a source, so
+        # sources come only from AnyCam: the API needs its password from
+        # every caller (local_auth), and the browser can name only streams
+        # AnyCam registered (handle_go2rtc_ws).
+        "app":    {"modules": ["api", "ws", "rtsp", "webrtc", "mp4", "ffmpeg", "exec"]},
+        "ffmpeg": {"bin": "ffmpeg"},
+        "api":    {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_API_PORT}",
+                   "username": GO2RTC_API_USER, "password": _GO2RTC_API_PASS,
+                   "local_auth": True},
         "rtsp":   {"listen": f"{GO2RTC_API_HOST}:{GO2RTC_RTSP_PORT}",
                    "username": GO2RTC_RTSP_USER, "password": _GO2RTC_RTSP_PASS},
         "webrtc": {"listen": f":{GO2RTC_WEBRTC_PORT}"},
@@ -84,6 +108,11 @@ def _go2rtc_config() -> str:
 
 def _go2rtc_api_url(path: str) -> str:
     return f"http://{GO2RTC_API_HOST}:{GO2RTC_API_PORT}{path}"
+
+
+def _go2rtc_session(**kw) -> aiohttp.ClientSession:
+    """3.7.4 (B47): a client session that gives go2rtc's API its password."""
+    return aiohttp.ClientSession(auth=aiohttp.BasicAuth(GO2RTC_API_USER, _GO2RTC_API_PASS), **kw)
 
 
 async def _go2rtc_log_pump(proc: asyncio.subprocess.Process) -> None:
@@ -103,7 +132,7 @@ async def _go2rtc_wait_ready(proc: asyncio.subprocess.Process) -> bool:
     """Poll go2rtc's API until it answers, the process exits, or time runs out."""
     deadline = time.monotonic() + GO2RTC_READY_TIMEOUT_S
     timeout = aiohttp.ClientTimeout(total=2)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _go2rtc_session(timeout=timeout) as session:
         while time.monotonic() < deadline:
             if proc.returncode is not None:
                 return False
@@ -230,8 +259,9 @@ async def _go2rtc_relay(camera_id: str, url: str | None) -> str | None:
     if (not url or not url.lower().startswith(("rtsp://", "rtsps://")) or not _GO2RTC_READY
             or _RELAY_FAILS.get(camera_id, 0) >= RELAY_FAIL_LIMIT):
         return url
-    name = _go2rtc_shared_name(camera_id, url)
-    if not await _go2rtc_register(name, url, camera_id):
+    src = _go2rtc_camera_src(CAMERAS.get(camera_id), url)   # 3.7.1 (B31), 3.7.4 (B47)
+    name = _go2rtc_shared_name(camera_id, src)
+    if not await _go2rtc_register(name, src, camera_id):
         return url
     return (f"rtsp://{GO2RTC_RTSP_USER}:{_GO2RTC_RTSP_PASS}@{GO2RTC_API_HOST}:"
             f"{GO2RTC_RTSP_PORT}/{name}")
@@ -303,7 +333,8 @@ def _go2rtc_native_source(camera: dict) -> tuple[str | None, str, str]:
         entry = _match_stream_db(camera) or {}
         path = (entry.get("rtsp") or ["/"])[0]
         rtsp = f"rtsp://{camera.get('ip', '')}:{entry.get('port') or 554}{path}"
-        return f"{build_authenticated_url(camera, url=rtsp) or rtsp}#transport={ws}", "", "ok"
+        return (_go2rtc_rtsp_src(f"{build_authenticated_url(camera, url=rtsp) or rtsp}#transport={ws}"),
+                "", "ok")
     return None, "", "this camera is not a WebRTC or WebSocket stream"
 
 
@@ -323,6 +354,124 @@ def _go2rtc_profiles(camera: dict) -> list[dict]:
     return profiles
 
 
+def _go2rtc_rtsp_src(url: str) -> str:
+    """3.7.1 (B31): an RTSP source for go2rtc, without two-way audio.
+
+    go2rtc asks every RTSP camera for its ONVIF backchannel (two-way audio)
+    unless the source ends in #backchannel=0; its README calls that option
+    "important for some glitchy cameras". Two older Hikvision cameras reset
+    go2rtc's connection about once a second (2026-10-06, about 900 resets),
+    while AnyCam's own probes and ffprobe worked. AnyCam never sends audio
+    to a camera, so every RTSP source carries it.
+    """
+    if url.lower().startswith(("rtsp://", "rtsps://")) and "#backchannel=" not in url:
+        return url + "#backchannel=0"
+    return url
+
+
+# ── 3.7.4 (B47): an ffmpeg copy in front of go2rtc ─────────────────────────
+# The Microseven (Hipcam firmware) never played live: go2rtc built the
+# browser's video description from the camera's own parameter sets, and
+# Chrome refused it ("coded size: [4,0]" with H.265, "Unrecognized video
+# codec profile" with H.264), while ffmpeg read the same stream at
+# 3840x2160. go2rtc issues 2361 and 2529 describe it; the documented cure is
+# an ffmpeg copy source, which rebuilds the parameter sets without decoding.
+# Only cameras that need it get it: the brand entry's live_ffmpeg_copy, or
+# the camera's own live_ffmpeg_copy, which wins.
+def _go2rtc_ffmpeg_copy(camera: dict | None) -> bool:
+    """True when this camera's go2rtc stream goes through an ffmpeg copy."""
+    if not camera:
+        return False
+    if "live_ffmpeg_copy" in camera:
+        return bool(camera["live_ffmpeg_copy"])
+    return bool((_identify_camera_brand(dict(camera)) or {}).get("live_ffmpeg_copy"))
+
+
+# 3.7.5-rc1.0 (B47, general): a browser that cannot read a camera's stream
+# description says so ("Invalid video decoder config", "Unrecognized video
+# codec profile", "stream parsing failed"); the page reports it, and AnyCam
+# switches that camera to the ffmpeg copy for good, whatever its brand.
+DESCRIPTION_ERRORS = ("decoder config", "codec profile", "parsing failed", "append_failed",
+                      "could not parse", "demuxer_error")
+
+
+def _description_error(reason: str) -> bool:
+    low = reason.lower()
+    return any(w in low for w in DESCRIPTION_ERRORS)
+
+
+async def api_live_repair(request: web.Request) -> web.Response:
+    """POST /api/live_repair  body: {"camera_id", "reason"} — use the ffmpeg copy for this camera."""
+    try:
+        body = await request.json()
+    except (ValueError, aiohttp.ContentTypeError):
+        return web.json_response({"error": "JSON body required"}, status=400)
+    camera_id = str(body.get("camera_id", ""))
+    reason = " ".join(str(body.get("reason", "")).split())[:200]
+    camera = CAMERAS.get(camera_id)
+    if not camera or not _description_error(reason):
+        return web.json_response({"error": "unknown camera or reason"}, status=400)
+    if _go2rtc_ffmpeg_copy(camera):
+        return web.json_response({"switched": False})
+    camera["live_ffmpeg_copy"] = True
+    save_cameras()
+    log.warning(f"LIVE [{camera_id}]: the browser could not read this camera's stream "
+                f"description ({reason}); AnyCam passes its stream through an ffmpeg copy "
+                f"from now on, and live view tries again")
+    return web.json_response({"switched": True})
+
+
+# 3.7.5-rc1.0 (B51): the camera's smoother, smaller stream, for the classic
+# view's Quality Switch. From the camera's own streams first (any brand),
+# then from its brand's stream table when the table's first two paths are a
+# main/sub pair by one of these swaps, then the Dahua/Lorex DVR rule.
+SUB_STREAM_SWAPS = (("main", "sub"), ("Main", "Sub"), ("subtype=0", "subtype=1"), ("101", "102"),
+                    ("/11", "/12"), ("stream1", "stream2"), ("video1", "video2"),
+                    ("profile1", "profile2"), ("Primary", "Secondary"), ("track1", "track2"),
+                    ("live1s1", "live1s2"), ("av0_0", "av0_1"), ("/ch01/0", "/ch01/1"))
+
+
+def _classic_sub_stream(camera: dict) -> str | None:
+    """The camera's sub-stream address (without password), or None."""
+    main = camera.get("stream_url") or ""
+    if not main.lower().startswith(("rtsp://", "rtsps://")):
+        return None
+    plain = _strip_creds(main)
+    main_w = camera.get("stream_width") or 0
+    best = None
+    for prof in camera.get("stream_profiles") or []:
+        u = prof.get("url") or ""
+        codec = (prof.get("stream_codec") or "").lower()
+        if (not u.lower().startswith(("rtsp://", "rtsps://")) or _strip_creds(u) == plain
+                or codec in ("mjpeg", "jpeg")):
+            continue
+        w = prof.get("stream_width") or 0
+        if main_w and w and w >= main_w:
+            continue
+        if best is None or w > best[0]:
+            best = (w, u)          # the largest stream below the main one
+    if best:
+        return best[1]
+    sub = _dahua_sub_stream(main)
+    if sub:
+        return sub
+    parts = urlsplit(main)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    paths = (_match_stream_db(camera) or {}).get("rtsp") or []
+    if len(paths) > 1 and path == paths[0]:
+        for a, b in SUB_STREAM_SWAPS:
+            if a in paths[0] and paths[0].replace(a, b, 1) == paths[1]:
+                return f"{parts.scheme}://{parts.netloc}{paths[1]}"
+    return None
+
+
+def _go2rtc_camera_src(camera: dict | None, url: str) -> str:
+    """The go2rtc source for an authenticated RTSP address of this camera."""
+    if _go2rtc_ffmpeg_copy(camera) and url.lower().startswith(("rtsp://", "rtsps://")):
+        return f"ffmpeg:{url}#video=copy#audio=copy"
+    return _go2rtc_rtsp_src(url)
+
+
 def _go2rtc_relay_url(camera: dict, raw: str | None,
                       codec: str) -> tuple[str | None, str, str]:
     """Check one RTSP URL can be relayed; return (auth url, codec, reason)."""
@@ -331,15 +480,15 @@ def _go2rtc_relay_url(camera: dict, raw: str | None,
     if not raw.lower().startswith(("rtsp://", "rtsps://")):
         return None, codec, "this profile is not RTSP"
     # Passthrough only. Browsers play H.264 and H.265 over WebRTC or MSE;
-    # nothing plays MJPEG or MPEG-4 Part 2 that way, and ffmpeg is not
-    # loaded in go2rtc to transcode them. Unknown codecs are let through:
+    # nothing plays MJPEG or MPEG-4 Part 2 that way, and AnyCam never has
+    # go2rtc transcode (its ffmpeg copy, B47, does not decode). Unknown codecs are let through:
     # the browser negotiates, and falls back if negotiation fails.
     if codec in ("mjpeg", "jpeg", "mpeg4", "mp4v"):
         return None, codec, f"{codec.upper()} cannot play as live video"
     url = build_authenticated_url(camera, url=raw)
     if not url:
         return None, codec, "no stream URL for this profile"
-    return url, codec, "ok"
+    return _go2rtc_camera_src(camera, url), codec, "ok"
 
 
 async def _go2rtc_register(name: str, src: str, camera_id: str) -> bool:
@@ -359,7 +508,7 @@ async def _go2rtc_register(name: str, src: str, camera_id: str) -> bool:
                   encoded=True)
     timeout = aiohttp.ClientTimeout(total=5)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with _go2rtc_session(timeout=timeout) as session:
             async with session.request(method, put_url) as resp:
                 body = (await resp.text()).strip()
                 # See CREDENTIALS above: with no config file, go2rtc has
@@ -429,6 +578,131 @@ def _go2rtc_card_source(camera: dict, h265: bool = True,
     return best[1], best[2], "ok"
 
 
+# ── 3.7.4 (B6, B32): a camera whose RTSP is stuck ─────────────────────────
+# 2026-10-06, the Microseven: stuck, it accepted connections and answered
+# nothing, or reset each one, also for VLC with AnyCam stopped; only a power
+# cycle cleared it. Every live and classic try then failed in turn (about
+# 50 s to a picture) and kept connecting to it. While stuck, AnyCam opens
+# no RTSP to the camera: cards and Enhanced View use its HTTP snapshots if
+# it has them, the card says to power-cycle it, and one quiet check every
+# RTSP_STUCK_RECHECK_S ends the state when the camera answers again.
+RTSP_STUCK_SIGNS = ("connection reset by peer", "broken pipe", "i/o timeout",
+                    "connection refused")
+# 3.7.5-rc1.0 (B50): reasons that name AnyCam's or go2rtc's own fault, never the camera's
+RTSP_NOT_CAMERA = ("unsupported scheme", "exec:", "127.0.0.1:28554")
+RTSP_STUCK_REPORTS = 2           # live view reports with a sign, within ...
+RTSP_STUCK_WINDOW_S = 120.0
+RTSP_STUCK_RECHECK_S = 300.0
+RTSP_STUCK_REASON = "the camera's live stream is not answering; power-cycle the camera if this lasts"
+_RTSP_STUCK: dict[str, dict] = {}            # camera_id -> {"since", "why"}
+_RTSP_SIGNS_SEEN: dict[str, list[float]] = {}
+
+
+def _rtsp_stuck(camera_id: str) -> bool:
+    return camera_id in _RTSP_STUCK
+
+
+def _rtsp_stuck_mark(camera_id: str, why: str) -> None:
+    """Record that this camera's RTSP is stuck, and start its quiet check."""
+    if camera_id in _RTSP_STUCK or camera_id not in CAMERAS:
+        return
+    # 3.7.5-rc1.0 (B50): a failure through go2rtc is AnyCam's own (2026-10-07:
+    # go2rtc could not run the ffmpeg copy, and the Microseven was marked stuck).
+    if _RELAY_FAILS.get(camera_id, 0):
+        log.info(f"LIVE [{camera_id}]: not marked stuck: the failures came through go2rtc ({why})")
+        return
+    _RTSP_STUCK[camera_id] = {"since": time.monotonic(), "why": why}
+    log.warning(f"LIVE [{camera_id}]: the camera's live stream (RTSP) is not answering ({why}). "
+                f"AnyCam stops connecting to it and shows its HTTP snapshots if it has them; "
+                f"if this lasts, cut the camera's power for 10 s. Checked again every "
+                f"{RTSP_STUCK_RECHECK_S / 60:.0f} min")
+    asyncio.create_task(_rtsp_stuck_recheck(camera_id))
+
+
+def _rtsp_stuck_sign(camera_id: str, reason: str) -> None:
+    """Count a live view failure that shows the camera dropping connections."""
+    low = reason.lower()
+    if not any(sign in low for sign in RTSP_STUCK_SIGNS) or any(n in low for n in RTSP_NOT_CAMERA):
+        return
+    now = time.monotonic()
+    seen = [t for t in _RTSP_SIGNS_SEEN.get(camera_id, []) if now - t < RTSP_STUCK_WINDOW_S]
+    seen.append(now)
+    _RTSP_SIGNS_SEEN[camera_id] = seen
+    if len(seen) >= RTSP_STUCK_REPORTS:
+        _RTSP_SIGNS_SEEN.pop(camera_id, None)
+        _rtsp_stuck_mark(camera_id, reason[:120])
+
+
+async def _rtsp_answers(camera: dict) -> bool:
+    """One RTSP request with the password, on one connection, inside the cooldown."""
+    url = build_authenticated_url(camera) or ""
+    plain = camera.get("stream_url") or ""
+    parts = urlsplit(url)
+    if not plain.lower().startswith(("rtsp://", "rtsps://")) or not parts.hostname:
+        return False
+    await _throttle_wait_if_needed(camera.get("ip", ""), _brand_throttle_seconds(camera),
+                                   "RTSP stuck check")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            _THREAD_POOL, _validate_rtsp_urls_single_socket, parts.hostname, parts.port or 554,
+            [plain], unquote(parts.username or ""), unquote(parts.password or ""), 6.0, None,
+            f"{camera.get('id', '')}/stuck-check")
+    except Exception as ex:
+        log.debug(f"LIVE [{camera.get('id', '')}]: stuck check failed: {ex}")
+        return False
+    return any(result.values())
+
+
+async def _rtsp_stuck_recheck(camera_id: str) -> None:
+    """Check a stuck camera every RTSP_STUCK_RECHECK_S until it answers."""
+    while camera_id in _RTSP_STUCK:
+        await asyncio.sleep(RTSP_STUCK_RECHECK_S)
+        camera = CAMERAS.get(camera_id)
+        if not camera:
+            _RTSP_STUCK.pop(camera_id, None)
+            return
+        if await _rtsp_answers(camera):
+            _RTSP_STUCK.pop(camera_id, None)
+            log.info(f"LIVE [{camera_id}]: the camera's live stream answers again — live view is back on")
+            return
+        log.info(f"LIVE [{camera_id}]: the camera's live stream still does not answer")
+
+
+# 3.7.2 (B40): the page reports when a card or Enhanced View gives up on
+# live view, so the add-on log shows it (before, only the browser console).
+LIVE_FAIL_WHERE = ("card", "enhanced view", "enhanced view retry")   # 3.7.3 (B45): the retry
+SMART_CODEC_HINT = ("if this camera uses H.264+, H.265+ or Smart Codec, turn it off, or set "
+                    "its I-frame interval equal to its frame rate")
+
+
+def _live_fail_line(camera_id: str, where: str, reason: str) -> str:
+    """The log line for one live view fallback."""
+    reason = " ".join(str(reason).split())[:200]
+    if where == "enhanced view retry":
+        return f"LIVE [{camera_id}]: enhanced view tries WebRTC, video only: {reason}"
+    then = "uses still pictures" if where == "card" else "uses the classic view"
+    line = f"LIVE [{camera_id}]: {where} {then}: {reason}"
+    if reason.startswith("no video within"):
+        line += f" ({SMART_CODEC_HINT})"
+    return line
+
+
+async def api_live_fail(request: web.Request) -> web.Response:
+    """POST /api/live_fail  body: {"camera_id", "where": one of LIVE_FAIL_WHERE, "reason"}."""
+    try:
+        body = await request.json()
+    except (ValueError, aiohttp.ContentTypeError):
+        return web.json_response({"error": "JSON body required"}, status=400)
+    camera_id = str(body.get("camera_id", ""))
+    where = body.get("where")
+    if camera_id not in CAMERAS or where not in LIVE_FAIL_WHERE:
+        return web.json_response({"error": "unknown camera or place"}, status=400)
+    log.info(_live_fail_line(camera_id, where, body.get("reason", "")))
+    _rtsp_stuck_sign(camera_id, str(body.get("reason", "")))     # 3.7.4 (B6, B32)
+    return web.json_response({"status": "ok"})
+
+
 async def api_go2rtc_card(request: web.Request) -> web.Response:
     """GET /api/go2rtc/card/{camera_id} — prepare a live card (2.6.6, C1).
 
@@ -451,6 +725,8 @@ async def api_go2rtc_card(request: web.Request) -> web.Response:
     if not camera:
         return web.json_response({"ok": False, "reason": "camera not found"},
                                  status=404)
+    if _rtsp_stuck(camera_id):                 # 3.7.4 (B6, B32): no RTSP to it
+        return web.json_response({"ok": False, "reason": RTSP_STUCK_REASON, "retry": True})
     src, codec, reason = _go2rtc_card_source(camera, h265=request.query.get("h265") != "0",
                                              wide=request.query.get("wide") == "1")
     if not src:
@@ -501,7 +777,7 @@ async def handle_go2rtc_ws(request: web.Request) -> web.StreamResponse:
 
     upstream = URL(_go2rtc_api_url(f"/api/ws?src={quote(name, safe='')}"),
                    encoded=True)
-    session = aiohttp.ClientSession()
+    session = _go2rtc_session()
     try:
         try:
             # max_msg_size=0: one MSE fragment carrying a 4K HEVC keyframe can

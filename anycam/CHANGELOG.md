@@ -1,3 +1,162 @@
+## 3.7.5
+
+Live view that recovers by itself, a Quality Switch for 4K cameras, calmer handling of stuck and fragile cameras, and scans that leave known cameras alone. Same code as 3.7.5-rc2.0. Not field-tested.
+
+### Changes & improvements
+
+- **Live view repairs itself.** A stream the browser cannot read goes through an ffmpeg copy, and AnyCam keeps that choice for the camera.
+- **Live view gives up after 15 s** when no picture arrives, tries WebRTC once more, and names the camera settings to check.
+- **Cards keep their last picture** while a stream restarts, and stay live for 60 s while the page is hidden.
+- **Quality Switch in the classic view** for cameras with a sub-stream; the classic view drops to keyframes instead of greying out when the Pi falls behind.
+- **A stuck camera is left alone.** AnyCam shows its still pictures, and the card says "Power-cycle camera".
+- **Scans leave saved cameras alone,** and a removed card comes back without probing.
+- **H.265 decodes in software,** because the Pi's HEVC hardware decoder gave green pictures. The log explains Protection mode.
+- **go2rtc's API asks every caller for a password.**
+
+### Bugs fixed
+
+- **Some cameras, such as older Hikvision models, reset every live connection.** AnyCam no longer asks for two-way audio.
+- **Cards and Enhanced View could stay black for good,** and the classic view could show one frozen picture.
+- **Cards on still pictures asked 8 times a second;** now once per new picture.
+- **ONVIF requests could go to a camera's RTSP port,** and the start-up check ignored the camera's cooldown.
+- **A slow network check made the scan search a fixed network** instead of AnyCam's own.
+
+### Known issues
+
+- **The Microseven needs one power cycle** before its live view can be tested.
+- **Other programs on the Pi can read camera video** through go2rtc's local RTSP server.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.5-rc2.0
+
+A release candidate that stops AnyCam's own start-up checks from upsetting fragile cameras. Not field-tested.
+
+### Changes & improvements
+
+- **A scan leaves cameras AnyCam already has alone.** A saved camera with a working stream is no longer probed on a restart, an update or a rescan.
+- **Removed cameras come back without probing.** Removing a card makes the camera scannable again, and AnyCam keeps its details (not its password), so a later scan gives the card back without walking its paths.
+- **The Quality Switch says when its smoother stream gives no picture.**
+
+### Bugs fixed
+
+- **ONVIF requests went to a camera's RTSP port** when no ONVIF address was saved. The Microseven was stuck minutes after it received them.
+- **The start-up check opened the camera's stream without waiting out its cooldown.**
+
+### Known issues
+
+- **The Microseven needs one power cycle** to leave its stuck state before the ffmpeg copy can be tested.
+- **Other programs on the Pi can read camera video** through go2rtc's local RTSP server.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.5-rc1.0
+
+A release candidate for the Microseven's live view, with a Quality Switch for 4K cameras in the classic view. Not field-tested.
+
+### Changes & improvements
+
+- **Any camera whose stream the browser cannot read is repaired automatically.** AnyCam passes it through an ffmpeg copy, keeps that choice, and tries live view again.
+- **Quality Switch in the classic view.** Off: full size, with keyframes only when the Pi cannot keep up. On: the camera's sub-stream, smaller but smoother. Shown only when the camera has a sub-stream.
+- **The classic view no longer greys out when the Pi falls behind.** It switches to keyframes only.
+
+### Bugs fixed
+
+- **The Microseven's ffmpeg copy never started** (3.7.4). go2rtc runs it through a module AnyCam did not load.
+- **A camera was marked "Power-cycle camera" after a go2rtc failure** that was not the camera's fault.
+
+### Known issues
+
+- **Other programs on the Pi can read camera video** through go2rtc's local RTSP server.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.4
+
+The Microseven gets live view, a camera whose stream gets stuck is handled calmly, and the Pi's broken HEVC hardware decoder is no longer used. Not field-tested.
+
+### Changes & improvements
+
+- **Microseven live view.** These cameras now play through an ffmpeg copy that repairs their stream description, without decoding.
+- **A stuck camera is left alone.** When a camera accepts connections but its live stream never answers, AnyCam stops connecting to it. It shows the camera's still pictures, and the card says "Power-cycle camera". AnyCam checks again every 5 minutes and turns live view back on by itself.
+- **H.265 decodes in software from the start.** The Pi's HEVC hardware decoder gave green pictures on every camera tested, so AnyCam no longer uses it.
+- **go2rtc's API now asks every caller for a password,** programs on the same Pi included.
+
+### Bugs fixed
+
+- **The Microseven never played live** in any browser. go2rtc built an invalid video description from its stream.
+- **Enhanced View retried over WebRTC when the camera itself had failed,** which only delayed the classic view.
+
+### Known issues
+
+- **Other programs on the Pi can read camera video** through go2rtc's local RTSP server, which does not ask local programs for its password.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.3
+
+Live view now gives up when no picture really arrives, Firefox gets a second try over WebRTC, the classic view shows real pictures, and cards on still pictures ask far less often. Not field-tested.
+
+### Changes & improvements
+
+- **Cards on still pictures ask once per new picture,** not 8 times a second. Five DVR channels went from about 40 requests a second to about 4.
+- **Enhanced View tries WebRTC, video only, before the classic view** when no picture arrives in 15 s.
+- **The start-up log line names the AnyCam version.**
+- **The hardware picture test also tries the camera's smallest H.265 stream,** to tell a lack of decoder memory from a decoder fault.
+
+### Bugs fixed
+
+- **A card or Enhanced View could stay black for good.** It counted the stream's description, or the browser's "playing" signal, as a picture. Now only a decoded picture counts.
+- **The classic view showed one grey or frozen picture.** ffmpeg repeated its first picture; it now sends each decoded picture once.
+- **Firefox: Enhanced View stayed black on H.265 cameras whose cards played.**
+
+### Known issues
+
+- **Hardware HEVC decode on the Pi gives a green picture;** AnyCam switches that camera to software. The picture test results decide the fix.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.2
+
+Cards that cannot play live now fall back to still pictures, cards keep their last picture while a stream restarts, and a broken hardware picture switches to software. Not field-tested.
+
+### Changes & improvements
+
+- **Cards keep their last picture** while a live stream starts again, instead of going black.
+- **Live view gives up after 15 s, not 30 s,** when no picture arrives. The message and the add-on log name the camera settings to check: H.264+, H.265+, Smart Codec and the I-frame interval.
+- **The add-on log shows when a card or Enhanced View gives up on live view,** with the reason.
+- **The login fields have no grey "admin" or dots.** An empty user name box now looks empty.
+- **A hardware picture test** decodes a few pictures in software and in three hardware ways, and logs which ways give a real picture (`/api/diagnostics/hwtest/<camera>`).
+
+### Bugs fixed
+
+- **A card whose live stream kept closing stayed black for good.** It now shows still pictures after 15 s and tries live view again later.
+- **The classic Enhanced View could stop at once and show "Loading" forever** when a live card had been open for a while.
+- **Hardware HEVC decode could give a frozen green picture.** After 50 identical pictures, AnyCam decodes that camera in software and runs the picture test one time.
+
+### Known issues
+
+- **Hardware HEVC decode on the Pi gives a green picture** with Protection mode off. AnyCam falls back to software; the fix waits for the picture test results.
+- **The Microseven waits on "Loading feed"** while its RTSP stream is broken, now for up to 15 s.
+- **One Amcrest camera can get two cards** (under investigation).
+
+## 3.7.1
+
+Cards come back at once after a short absence, older Hikvision cameras play live, and the hardware decode report is right. Not field-tested.
+
+### Changes & improvements
+
+- **Live cards stay live for 60 s while the page is hidden.** Come back from another program within a minute and the video is already playing. After a minute the streams close, as before.
+- **The hardware decode report names the fix:** when the add-on may not open the decoders, the log says to turn off Protection mode on AnyCam's Info page.
+
+### Bugs fixed
+
+- **Some cameras reset every live connection.** go2rtc asked each camera for two-way audio, which some cameras, such as older Hikvision models, refuse. AnyCam now never asks for it.
+- **The log warned that the HEVC decoder overlay was missing** on a Pi where it is present. Newer Raspberry Pi kernels name the decoder `rpi-hevc-dec`.
+- **The HEVC hardware decoder was listed as available** when the add-on was not allowed to open it.
+- **A slow network check made the scan search a fixed network** (192.168.1.0/24) instead of AnyCam's own. AnyCam now tries again, then uses its own address, and never guesses.
+
+### Known issues
+
+- **Hardware decode needs Protection mode off** for AnyCam.
+- **One Amcrest camera can get two cards,** for ports 554 and 37777 (under investigation).
+- **The Microseven waits about 30 s on "Loading feed"** while its RTSP stream is broken.
+
 ## 3.7.0
 
 AnyCam gets detection zones, sound and more live cards, one camera connection through go2rtc, and recording upload. Same code as 3.7.0-rc2.0, field-tested on test system B.

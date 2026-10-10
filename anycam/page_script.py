@@ -152,49 +152,83 @@ const _snapErrSince = {};  // camId → time of the first error in the run
 // unavailable" only after 90 s of errors.
 const SNAP_UNAVAILABLE_MS = 90000;
 
+// 3.7.3 (B42): the add-on holds a request that names the picture the card
+// shows (?after=N, its X-Frame-Count) until it has a newer one, up to 2 s.
+// So a card asks once per new picture: about once a second for an
+// HTTP-polled DVR channel, not 8 times. Pictures arrive with fetch, as
+// blobs; a stopped run (stopSnap, a newer startSnap) drops its answer.
+const _snapGen   = {};   // camId → run number
+const _snapShown = {};   // camId → {n, url}: the picture on the card
+const SNAP_NEXT_MS = 50;       // after a picture; the add-on does the waiting
+const SNAP_NEXT_NO_COUNT_MS = 125;   // an answer without X-Frame-Count
+
 function startSnap(camId) {
   stopSnap(camId);
   _snapErrors[camId] = 0;
-  const poll = () => {
+  const gen = _snapGen[camId];
+  const next = ms => { if (_snapGen[camId] === gen) _snapTimers[camId] = setTimeout(poll, ms); };
+  const failed = display => {
+    _snapErrors[camId] = (_snapErrors[camId] || 0) + 1;
+    const errs = _snapErrors[camId];
+    console.warn('[AnyCam] snapshot error #' + errs + ' for ' + camId);
+    if (!_snapErrSince[camId]) _snapErrSince[camId] = Date.now();
+    const unavailable = Date.now() - _snapErrSince[camId] >= SNAP_UNAVAILABLE_MS;
+    if (errs >= 3) {
+      // After 3 consecutive errors, show the placeholder
+      display.style.display = 'none';
+      const ph = document.getElementById('ph-' + camId);
+      if (ph) {
+        ph.querySelector('span').textContent =
+          unavailable ? 'Stream unavailable' : 'Loading feed, please wait…';
+        ph.style.display = 'flex';
+      }
+    }
+    // Back off: 500ms for first few errors, 2s after 5 errors
+    next(errs > 5 ? 2000 : 500);
+  };
+  const poll = async () => {
     const display = document.querySelector('[data-snap="' + camId + '"]');
     if (!display) { stopSnap(camId); return; }   // card was removed
-    const loader = new Image();
-    loader.onload = () => {
+    const shown = _snapShown[camId] || {n: -1, url: ''};
+    // A redrawn card has a new, empty image: ask for a picture at once.
+    const onCard = shown.url && display.src === shown.url;
+    let r = null, blob = null, n = NaN;
+    try {
+      r = await fetch(BASE + '/snapshot/' + camId + '?after=' + (onCard ? shown.n : -1)
+                      + '&t=' + Date.now());
+      if (_snapGen[camId] !== gen) return;
+      if (r.ok && r.status === 200) {
+        n = parseInt(r.headers.get('X-Frame-Count'), 10);
+        if (onCard && n === shown.n) { next(SNAP_NEXT_MS); return; }   // nothing newer yet
+        blob = await r.blob();
+      }
+    } catch (e) {}
+    if (_snapGen[camId] !== gen) return;
+    if (!blob) { failed(display); return; }
+    const url = URL.createObjectURL(blob);
+    display.onload = () => {
+      if (_snapGen[camId] !== gen) return;
       _snapErrors[camId] = 0;
       delete _snapErrSince[camId];
+      if (shown.url && shown.url !== url) URL.revokeObjectURL(shown.url);
+      _snapShown[camId] = {n: Number.isNaN(n) ? -1 : n, url};
       // Show img, hide placeholder
-      display.src         = loader.src;
       display.style.display = '';
       const ph = document.getElementById('ph-' + camId);
       if (ph) ph.style.display = 'none';
-      // Next poll: 125ms (~8fps) matches server vf=fps=8
-      _snapTimers[camId] = setTimeout(poll, 125);
+      next(Number.isNaN(n) ? SNAP_NEXT_NO_COUNT_MS : SNAP_NEXT_MS);
     };
-    loader.onerror = () => {
-      _snapErrors[camId] = (_snapErrors[camId] || 0) + 1;
-      const errs = _snapErrors[camId];
-      console.warn('[AnyCam] snapshot error #' + errs + ' for ' + camId);
-      if (!_snapErrSince[camId]) _snapErrSince[camId] = Date.now();
-      const failed = Date.now() - _snapErrSince[camId] >= SNAP_UNAVAILABLE_MS;
-      if (errs >= 3) {
-        // After 3 consecutive errors, show the placeholder
-        display.style.display = 'none';
-        const ph = document.getElementById('ph-' + camId);
-        if (ph) {
-          ph.querySelector('span').textContent =
-            failed ? 'Stream unavailable' : 'Loading feed, please wait…';
-          ph.style.display = 'flex';
-        }
-      }
-      // Back off: 500ms for first few errors, 2s after 5 errors
-      _snapTimers[camId] = setTimeout(poll, errs > 5 ? 2000 : 500);
+    display.onerror = () => {
+      URL.revokeObjectURL(url);
+      if (_snapGen[camId] === gen) failed(display);
     };
-    loader.src = BASE + '/snapshot/' + camId + '?t=' + Date.now();
+    display.src = url;
   };
   poll();   // start immediately
 }
 
 function stopSnap(camId) {
+  _snapGen[camId] = (_snapGen[camId] || 0) + 1;
   if (_snapTimers[camId]) { clearTimeout(_snapTimers[camId]); delete _snapTimers[camId]; }
 }
 
@@ -1040,8 +1074,52 @@ async function resetCamSettings() {
  * keyframe. An H.264 camera with keyframes far apart took 19 to 28 s to its
  * first frame on every connection in the 2026-09-29 log, so 12 s always
  * failed there.
+ *
+ * 3.7.2 (B40): 15 s. That camera was the Oak-D add-on, whose encoder set
+ * no keyframe interval. A camera on normal settings sends a keyframe every
+ * 1 to 2 s; Hikvision's H.264+/H.265+ every 8 to 12 s. 15 s covers those
+ * plus the connection. A timeout names the camera settings to change
+ * (SMART_CODEC_HELP), on screen and in the add-on log.
  */
-const GO2RTC_FIRST_FRAME_MS = 30000;
+const GO2RTC_FIRST_FRAME_MS = 15000;
+
+// 3.7.3 (B41): has the browser decoded a picture? The size alone is not
+// enough: MSE gives it before any frame decodes (the Oak-D card in LibreWolf:
+// width 1280, readyState 1, 0 frames, black for good), and Firefox fires
+// 'playing' with no frame (Enhanced View: "Live (MSE): … · 0 fps").
+function _videoHasFrame(v) {
+  if (!v || !(v.videoWidth > 0)) return false;
+  const q = (typeof v.getVideoPlaybackQuality === 'function') ? v.getVideoPlaybackQuality() : null;
+  const frames = q ? q.totalVideoFrames : (v.webkitDecodedFrameCount || 0);
+  return frames > 0 || v.readyState >= 2;
+}
+const SMART_CODEC_HELP = 'If this camera uses H.264+, H.265+ or Smart Codec, turn it off, '
+                       + 'or set its I-frame interval equal to its frame rate.';
+
+// 3.7.5-rc1.0 (B47, general): the browser could not read the camera's
+// stream description (Chrome: "Invalid video decoder config", "Unrecognized
+// video codec profile", "stream parsing failed"). The add-on then passes
+// that camera through an ffmpeg copy, which rebuilds the description, and
+// live view tries again once. Any brand; the add-on keeps the choice.
+const DESCRIPTION_ERROR_RE = /decoder config|codec profile|parsing failed|append_failed|could not parse|demuxer_error/i;
+async function _liveRepair(camId, reason) {
+  try {
+    const r = await fetch(BASE + '/api/live_repair', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({camera_id: camId, reason})});
+    const d = await r.json();
+    return !!(d && d.switched);
+  } catch (e) { return false; }
+}
+
+// 3.7.2 (B40): tell the add-on log when live view gives up.
+function _liveFailReport(camId, where, reason) {
+  try {
+    fetch(BASE + '/api/live_fail', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({camera_id: camId, where, reason})})
+      .catch(() => {});
+  } catch (e) {}
+}
 const FOCUS_BLANK_POSTER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 let _go2rtc          = null;   // live session state; see _go2rtcMount
 let _go2rtcWatchdog  = null;
@@ -1075,8 +1153,33 @@ function _go2rtcLoadPlayer() {
           // app) draws a large gray play icon until the first frame.
           this.video.poster   = FOCUS_BLANK_POSTER;
           this.video.addEventListener('playing', () => this._emit('playing'));
+          // 3.7.5-rc1.0 (B47): the browser's own reason when it cannot use the stream
+          this.video.addEventListener('error', () => {
+            const e = this.video.error;
+            this._emit('decode', e ? (e.message || ('media error ' + e.code)) : '');
+          });
+        }
+        // 3.7.2 (B39): keep the last picture as the poster while the stream
+        // starts again, instead of about 2 s of black. The video drops its
+        // picture when ondisconnect clears it or onopen gives it a new source.
+        _keepPicture() {
+          const v = this.video;
+          if (!v || !v.videoWidth || !v.videoHeight) return;
+          try {
+            const c = document.createElement('canvas');
+            const k = Math.min(1, 1280 / v.videoWidth);
+            c.width  = Math.round(v.videoWidth * k);
+            c.height = Math.round(v.videoHeight * k);
+            c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+            v.poster = c.toDataURL('image/jpeg', 0.8);
+          } catch (e) {}
+        }
+        ondisconnect() {
+          this._keepPicture();
+          return super.ondisconnect();
         }
         onopen() {
+          this._keepPicture();
           const modes = super.onopen();
           this.onmessage['anycam'] = msg => {
             if (msg.type === 'error') this._emit('error', String(msg.value || ''));
@@ -1084,6 +1187,14 @@ function _go2rtcLoadPlayer() {
           };
           this._emit('open', modes);
           return modes;
+        }
+        // 3.7.1 (B27): a page hidden for less than LIVE_HIDDEN_GRACE_MS keeps
+        // its streams, so coming back from another program shows live video at
+        // once, not ~2 s of black while each stream starts again. Off screen
+        // and Enhanced View's pause keep VideoRTC's own 5 s.
+        disconnectedCallback() {
+          this.DISCONNECT_TIMEOUT = document.hidden ? LIVE_HIDDEN_GRACE_MS : 5000;
+          return super.disconnectedCallback();
         }
         onclose() {
           // VideoRTC closes the socket on purpose after a WebRTC handoff, and
@@ -1209,17 +1320,18 @@ async function _go2rtcTryFocus(camId, cam, session) {
   return true;
 }
 
-function _go2rtcMount(camId, cam, info, session) {
+// rtcOnly (3.7.3, B45): the second try, WebRTC and video only.
+function _go2rtcMount(camId, cam, info, session, rtcOnly) {
   const img  = document.getElementById('focus-img');
   const wrap = document.getElementById('focus-video');
   img.style.display  = 'none';
   wrap.innerHTML     = '';
   wrap.style.display = 'block';
   const el = document.createElement('anycam-video');
-  el.mode  = 'webrtc,mse';
-  el.media = 'video,audio';    // 3.2.0 (C5): sound too; it starts muted
+  el.mode  = rtcOnly ? 'webrtc' : 'webrtc,mse';
+  el.media = rtcOnly ? 'video' : 'video,audio';    // 3.2.0 (C5): sound too; it starts muted
   _go2rtc = {
-    el, camId, cam, session,
+    el, camId, cam, session, rtcOnly: !!rtcOnly,
     stream: info.stream,
     codec: String(info.codec || cam.stream_codec || '').toUpperCase(),
     played: false, closes: 0, modes: [], errs: {},
@@ -1232,6 +1344,7 @@ function _go2rtcMount(camId, cam, info, session) {
   const watchdog = () => {
     // A hidden tab pauses VideoRTC by design; do not blame the stream for it.
     if (document.hidden) { _go2rtcWatchdog = setTimeout(watchdog, GO2RTC_FIRST_FRAME_MS); return; }
+    if (_go2rtcRetryWebRTC(session)) return;
     _go2rtcFail(session, 'no video within ' + (GO2RTC_FIRST_FRAME_MS / 1000) + ' s', false);
   };
   _go2rtcWatchdog = setTimeout(watchdog, GO2RTC_FIRST_FRAME_MS);
@@ -1241,16 +1354,48 @@ function _go2rtcMount(camId, cam, info, session) {
   _go2rtcUpdateInfo();
 }
 
+// 3.7.3 (B45): Firefox played the Lorex H.265 channels over WebRTC in the
+// cards (video only) but not over MSE, which VideoRTC picks when Enhanced
+// View asks for sound too. With no picture in GO2RTC_FIRST_FRAME_MS, try
+// once more over WebRTC with video only, before the classic view.
+function _go2rtcRetryWebRTC(session) {
+  const g = _go2rtc;
+  // 3.7.4 (B46): only when MSE received the stream. With no stream at all
+  // (the camera failed), a WebRTC try fails too and only delays the
+  // classic view (the Microseven, 2026-10-06: 4 s for nothing).
+  if (!g || g.session !== session || g.rtcOnly || g.mode !== 'MSE'
+      || !g.modes.includes('webrtc')) return false;
+  console.info('[AnyCam] no picture in Enhanced View for ' + g.camId + ' — trying WebRTC, video only');
+  _liveFailReport(g.camId, 'enhanced view retry',
+                  'no video within ' + (GO2RTC_FIRST_FRAME_MS / 1000) + ' s over MSE');
+  const camId = g.camId, cam = g.cam, info = {stream: g.stream, codec: g.codec};
+  _go2rtcUnmount();
+  _go2rtcMount(camId, cam, info, session, true);
+  return true;
+}
+
 function _go2rtcEvent(session, kind, value) {
   const g = _go2rtc;
   if (!g || g.session !== session) return;
   if (kind === 'playing') {
-    _go2rtcPlayed(g);
+    if (_videoHasFrame(g.el.video)) _go2rtcPlayed(g);   // else the 1 s check decides
   } else if (kind === 'open') {
     g.modes = Array.isArray(value) ? value : [];
   } else if (kind === 'mode') {
     g.mode = value;
     _go2rtcUpdateInfo();
+  } else if (kind === 'decode') {
+    console.warn('[AnyCam] live view: the browser cannot use the stream: ' + value);
+    if (g.played || g.repairTried || !DESCRIPTION_ERROR_RE.test(value || '')) return;
+    g.repairTried = true;
+    const camId = g.camId, cam = g.cam;
+    _liveRepair(camId, value).then(switched => {
+      if (!switched || !_go2rtc || _go2rtc.session !== session) return;
+      _go2rtcUnmount();
+      _go2rtcTryFocus(camId, cam, session).then(ok => {
+        if (!ok && session === _focusSession) _go2rtcToClassic(camId, cam, '', false);
+      });
+    });
   } else if (kind === 'error') {
     console.warn('[AnyCam] go2rtc: ' + value);
     if (g.played) return;   // VideoRTC recovers on its own once it has played
@@ -1289,7 +1434,7 @@ function _go2rtcStats(session) {
   g.lastFrames = frames;
   // The counter restarts when VideoRTC swaps MSE for WebRTC; skip that tick.
   g.fps = delta >= 0 ? delta : null;
-  if (!g.played && frames > 0 && v.videoWidth > 0) _go2rtcPlayed(g);
+  if (!g.played && _videoHasFrame(v)) _go2rtcPlayed(g);
   _go2rtcUpdateInfo();
 }
 
@@ -1395,9 +1540,11 @@ function _go2rtcFail(session, reason, remember) {
   console.warn('[AnyCam] live view failed for ' + g.camId + ': ' + reason
                + ' — using the classic view');
   if (remember) _go2rtcDeclined[g.camId] = reason;
+  _liveFailReport(g.camId, 'enhanced view', reason);
   // 3.0.1 (C10): readable text, and the fix when the browser cannot play H.265
   const readable = _readableLiveError(reason);
-  const help = readable === 'this browser cannot play H.265 video' ? ' ' + _h265Help() : '';
+  const help = readable === 'this browser cannot play H.265 video' ? ' ' + _h265Help()
+             : /^no video within/.test(readable) ? ' ' + SMART_CODEC_HELP : '';
   _go2rtcToClassic(g.camId, g.cam,
                    'Live view unavailable (' + readable + ') — using the classic view.' + help, true);
 }
@@ -1523,7 +1670,7 @@ function _cardQuery() {
 }
 
 async function _cardLiveStart(camId) {
-  const st = {el: null, played: false, modes: [], errs: {}, closes: 0, tid: 0};
+  const st = {el: null, played: false, modes: [], errs: {}, closes: 0};
   _cardLive[camId] = st;
   let info = null;
   try {
@@ -1553,7 +1700,6 @@ async function _cardLiveStart(camId) {
   if (!el.isConnected) { _cardLiveFail(camId, st, 'card is gone', false); return; }
   el.src = BASE + '/go2rtc/ws?src=' + encodeURIComponent(info.stream);
   _cardLiveArm(camId, st);
-  if (!_cardLiveTick) _cardLiveTick = setInterval(_cardLiveCheck, 1000);
 }
 
 /* ── 3.1.0 (C19): a card that plays the camera's MJPEG stream ────────────
@@ -1628,7 +1774,10 @@ function _cardMjpegClose(st) {
 }
 
 // A hidden page or an open Enhanced View closes the MJPEG streams, as
-// VideoRTC does for the other live cards.
+// VideoRTC does for the other live cards. 3.7.1 (B27): a hidden page closes
+// them only after LIVE_HIDDEN_GRACE_MS.
+const LIVE_HIDDEN_GRACE_MS = 60000;
+let _mjpegHideTID = 0;
 function _cardMjpegPause(pause) {
   Object.keys(_cardLive).forEach(camId => {
     const st = _cardLive[camId];
@@ -1638,43 +1787,72 @@ function _cardMjpegPause(pause) {
     else if (st.el && st.el.isConnected) _cardMjpegOpen(camId, st);
   });
 }
-document.addEventListener('visibilitychange', () => _cardMjpegPause(document.hidden || !!_focusCamId));
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(_mjpegHideTID);
+  _mjpegHideTID = 0;
+  if (document.hidden && !_focusCamId) {
+    _mjpegHideTID = setTimeout(() => { _mjpegHideTID = 0; _cardMjpegPause(true); }, LIVE_HIDDEN_GRACE_MS);
+  } else {
+    _cardMjpegPause(document.hidden || !!_focusCamId);
+  }
+});
 
-// Give up on a card that shows no video within GO2RTC_FIRST_FRAME_MS of
-// actually connecting. An off-screen or hidden player is not connected,
-// so the time does not count against it.
+// Give up on a card that shows no video after GO2RTC_FIRST_FRAME_MS of
+// trying. A hidden page, an open Enhanced View and a player paused off
+// screen do not count.
+// 3.7.2 (B35): a player that lost its socket and waits to reconnect (up to
+// 15 s in VideoRTC) is still trying. Before, only an open socket counted, so
+// the Oak-D card, whose stream closed after 1 to 2 s each time, never gave up.
 function _cardLiveArm(camId, st) {
-  clearTimeout(st.tid);
-  st.tid = setTimeout(() => {
-    if (_cardLive[camId] !== st || st.played) return;
-    const connected = st.kind === 'mjpeg' ? !!st.ws : !!(st.el.ws || st.el.pc);
-    if (document.hidden || _focusCamId || !connected) { _cardLiveArm(camId, st); return; }
-    _cardLiveFail(camId, st, 'no video within ' + (GO2RTC_FIRST_FRAME_MS / 1000) + ' s', false);
-  }, GO2RTC_FIRST_FRAME_MS);
+  st.tried = 0;
+  if (!_cardLiveTick) _cardLiveTick = setInterval(_cardLiveCheck, 1000);
 }
 
-// Once a second: catch a first frame in browsers that do not fire 'playing'.
+function _cardLiveTrying(st) {
+  if (document.hidden || _focusCamId) return false;
+  if (st.kind === 'mjpeg') return !!st.ws;
+  const el = st.el;
+  if (!el || !el.isConnected || el.disconnectTID) return false;
+  return !!(el.ws || el.pc) || el.wsState !== WebSocket.CLOSED || el.pcState !== WebSocket.CLOSED;
+}
+
+// Once a second: catch a first frame in browsers that do not fire 'playing',
+// and count the time each card has tried.
 function _cardLiveCheck() {
   Object.keys(_cardLive).forEach(camId => {
     const st = _cardLive[camId];
+    if (st.played) return;
     const v = st.el && st.el.video;
-    if (!st.played && v && v.videoWidth > 0) _cardLivePlayed(camId, st);
+    if (_videoHasFrame(v)) { _cardLivePlayed(camId, st); return; }
+    if (st.tried === undefined || !_cardLiveTrying(st)) return;
+    st.tried += 1000;
+    if (st.tried >= GO2RTC_FIRST_FRAME_MS)
+      _cardLiveFail(camId, st, 'no video within ' + (GO2RTC_FIRST_FRAME_MS / 1000) + ' s', false);
   });
 }
 
 function _cardLivePlayed(camId, st) {
   if (st.played) return;
   st.played = true;
-  clearTimeout(st.tid);
   _cardLiveShow(camId);
 }
 
 function _cardLiveEvent(camId, st, kind, value) {
   if (_cardLive[camId] !== st) return;
   if (kind === 'playing') {
-    _cardLivePlayed(camId, st);
+    if (_videoHasFrame(st.el && st.el.video)) _cardLivePlayed(camId, st);
   } else if (kind === 'open') {
     st.modes = Array.isArray(value) ? value : [];
+  } else if (kind === 'decode') {
+    if (st.played || st.repairTried || !DESCRIPTION_ERROR_RE.test(value || '')) return;
+    st.repairTried = true;
+    _liveRepair(camId, value).then(switched => {
+      if (!switched || _cardLive[camId] !== st) return;
+      _cardLiveFail(camId, st, 'switching to an ffmpeg copy of the stream', false);
+      delete _cardLiveOff[camId];
+      stopSnap(camId);
+      cardLiveAttach(camId);
+    });
   } else if (kind === 'error') {
     if (st.played) return;   // VideoRTC recovers on its own once it has played
     const failed = st.modes.find(m => value.startsWith(m));
@@ -1693,7 +1871,7 @@ function _cardLiveEvent(camId, st, kind, value) {
 function _cardLiveFail(camId, st, reason, remember) {
   if (_cardLive[camId] !== st) return;
   console.info('[AnyCam] card ' + camId + ' uses snapshots: ' + reason);
-  clearTimeout(st.tid);
+  if (!/^card (removed|is gone)$/.test(reason)) _liveFailReport(camId, 'card', reason);
   if (st.kind === 'mjpeg') _cardMjpegClose(st);
   if (st.el) {
     st.el.onanycam = null;
@@ -1755,6 +1933,38 @@ async function openFocus(camId) {
   _startFocusPoll(camId, cam);
 }
 
+/* ── 3.7.5-rc1.0 (B51): the classic view's Quality Switch ────────────────
+ * Shown only when the camera has a sub-stream (header X-Quality-Switch:
+ * "on" or "off"; empty means none). Off: full size, keyframes only when the
+ * Pi cannot keep up. On: the sub-stream, smaller but at its full rate. */
+function _qualitySwitch(camId, state) {
+  const box = document.getElementById('focus-controls');
+  if (!box || box.dataset.quality === state) return;
+  box.dataset.quality = state;
+  box.dataset.sound = '';
+  // 3.7.5-rc2.0: "failed" — the sub-stream gave no picture, so the view
+  // stays at full size; the switch says so instead of doing nothing visible.
+  box.innerHTML = !state ? ''
+    : '<label class="qswitch" title="Switch to a lower resolution but smoother video stream">'
+      + '<span class="qrow"><input type="checkbox" id="quality-switch"'
+      + (state === 'on' || state === 'failed' ? ' checked' : '')
+      + ' onchange="setQualitySwitch(' + jsArg(camId) + ', this.checked)"> Quality Switch</span>'
+      + (state === 'failed'
+         ? '<span class="qsub qfail">The smoother stream gave no picture, so this view stays at full size</span>'
+         : '<span class="qsub">Switch to a lower resolution but smoother video stream</span>')
+      + '</label>';
+}
+
+async function setQualitySwitch(camId, smooth) {
+  const box = document.getElementById('focus-controls');
+  if (box) box.dataset.quality = smooth ? 'on' : 'off';
+  try {
+    await fetch(BASE + '/api/cameras/' + encodeURIComponent(camId) + '/quality_switch',
+                {method: 'POST', headers: {'Content-Type': 'application/json'},
+                 body: JSON.stringify({smooth: !!smooth})});
+  } catch (e) {}
+}
+
 async function _startFocusPoll(camId, cam) {
   _focusCamId = camId;
   const img   = document.getElementById('focus-img');
@@ -1807,7 +2017,7 @@ async function _startFocusPoll(camId, cam) {
     const realFps  = _liveFps  !== null ? _liveFps + ' fps' : 'measuring…';
     const stepRes  = _stepRes  || '…';
     const stepFpsS = _stepFps  !== null
-      ? (_stepFps === 'uncapped' ? 'uncapped' : _stepFps + ' fps')
+      ? (/^\d+$/.test(_stepFps) ? _stepFps + ' fps' : _stepFps)
       : '…';
     // Only show Adapted Quality when using ffmpeg (rtsp mode): in http
     // fallback mode there is no quality ladder.
@@ -1881,6 +2091,7 @@ async function _startFocusPoll(camId, cam) {
           _stepRes = stepRes;
         }
         if (stepFps) _stepFps = stepFps;
+        _qualitySwitch(camId, resp.headers.get('X-Quality-Switch') || '');   // 3.7.5-rc1.0 (B51)
         const httpFallback = (snapMode === 'http');
         // 2.4.0-rc3.2: surface the fallback transition as a visible toast.
         // We reuse the focus-warning element that already exists for the
@@ -3060,9 +3271,9 @@ function credFormHTML(cam) {
   if (cam.status !== 'needs_credentials' || ['webrtc','wsrtsp'].includes(cam.display)) return '';
   return '<div class="cred-form">'
     + '<label>USERNAME</label>'
-    + '<input type="text" id="u_' + cam.id + '" placeholder="admin" autocomplete="username">'
+    + '<input type="text" id="u_' + cam.id + '" autocomplete="username">'
     + '<label>PASSWORD</label>'
-    + '<input type="password" id="p_' + cam.id + '" placeholder="••••••••"'
+    + '<input type="password" id="p_' + cam.id + '"'
     + ' autocomplete="current-password"'
     + ' onkeydown="if(event.key===\'Enter\')submitCreds(' + jsArg(cam.id) + ')">'
     + '<div class="cred-error" id="err_' + cam.id + '"></div>'
@@ -3283,6 +3494,12 @@ function cardHTML(cam) {
   const notCamBtn =
     '<button class="btn btn-ghost btn-sm" onclick="markNotCamera(' + jsArg(cam.id) + ')"'
     + ' title="Permanently hide — not a camera">🚫 Not a Camera</button>';
+  // 3.7.4 (B6, B32): the camera accepts connections but its live stream
+  // does not answer; only a power cycle has cleared that so far.
+  const stuckBdg = cam.rtsp_stuck
+    ? '<span class="badge" style="background:#3a2a10;color:var(--orange)" title="The camera'
+      + "'" + 's live stream does not answer, so this card shows still pictures. Cut the camera'
+      + "'" + 's power for 10 s; AnyCam checks again every 5 minutes.">⚠ Power-cycle camera</span>' : '';
   const upgradeBdg = cam.upgrade_missing
     ? '<span class="badge" style="background:#3a2a10;color:var(--orange)">⚠ Not found after upgrade</span>' : '';
   const hevcPlusBdg = cam.hevc_plus_warning && !cam.has_sub_stream
@@ -3327,8 +3544,8 @@ function cardHTML(cam) {
           + ' onclick="event.stopPropagation();openCamSettings(' + jsArg(cam.id) + ')">' + COG_SVG + '</button>'
         : '')
     + '</div>'
-    + ((uncBdg + upgradeBdg + hevcPlusBdg + lockedBdg)
-        ? '<div class="badges">' + uncBdg + upgradeBdg + hevcPlusBdg + lockedBdg + '</div>'
+    + ((uncBdg + stuckBdg + upgradeBdg + hevcPlusBdg + lockedBdg)
+        ? '<div class="badges">' + uncBdg + stuckBdg + upgradeBdg + hevcPlusBdg + lockedBdg + '</div>'
         : '')
     + identityHTML(cam)
     + credFormHTML(cam)
