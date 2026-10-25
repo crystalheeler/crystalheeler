@@ -39,6 +39,9 @@ function switchView(v) {
   const viewMap = {cameras: 'cameras-view', pscan: 'pscan-view', add: 'add-view', storage: 'storage-view'};
   document.getElementById(viewMap[v] || 'cameras-view').classList.add('active');
   document.getElementById('pscan-btn').classList.toggle('active', v === 'pscan');
+  // 4.1.0 (D7): Back to Cameras in the status bar on every menu
+  const back = document.getElementById('status-back');
+  if (back) back.style.display = (viewMap[v] && v !== 'cameras') ? '' : 'none';
   document.getElementById('add-btn').classList.toggle('active', v === 'add');
   document.getElementById('storage-btn').classList.toggle('active', v === 'storage');
   if (v === 'storage') loadStorage();
@@ -46,9 +49,7 @@ function switchView(v) {
     loadArpHosts();
     fetch(BASE + '/api/pscan/status').then(r => r.json()).then(s => {
       if (s.running) {
-        document.getElementById('ps-start').disabled = true;
-        document.getElementById('ps-pause').style.display = '';
-        document.getElementById('ps-cancel').style.display = '';
+        psSetRunning(true);
         document.getElementById('ps-prog-track').style.display = '';
         _paused = s.paused || false;
         document.getElementById('ps-pause').textContent = _paused ? '▶ Resume' : '⏸ Pause';
@@ -64,9 +65,14 @@ function switchView(v) {
 }
 
 /* ── Camera scan ───────────────────────────────────────────────────────────── */
-async function startScan() {
-  if (!document.getElementById('cameras-view').classList.contains('active'))
+// 4.1.0 (D6): Rescan Entire System, in the Scans menu. The menu stays open
+// until the scan finds its first new camera, then shows the cameras.
+let _rescanWatch = false;
+
+async function startScan(fromMenu) {
+  if (!fromMenu && !document.getElementById('cameras-view').classList.contains('active'))
     switchView('cameras');
+  _rescanWatch = !!fromMenu;
   const broad = document.getElementById('broad-sweep').checked;
   const r = await fetch(BASE + '/api/scan', {
     method: 'POST',
@@ -113,9 +119,17 @@ async function pollScan() {
       timerEl.style.display = 'none';
     }
     _updateCancelBtn(s.running);
+    if (_rescanWatch && s.running && (s.new_cameras || 0) > 0) {
+      _rescanWatch = false;
+      if (document.getElementById('pscan-view').classList.contains('active')) {
+        switchView('cameras');
+        showToast('New camera found: its card appears when the scan finishes');
+      }
+    }
     if (s.running) {
       pollT = setTimeout(pollScan, 1500);
     } else {
+      _rescanWatch = false;
       document.getElementById('scan-btn').disabled = false;
       document.getElementById('status-bar').classList.remove('scanning');
       document.getElementById('progress-track').style.display = 'none';
@@ -741,6 +755,8 @@ async function toggleMotion(camId) {
  * 3 s. 2.6.5: one request for all cameras. Before, the page asked only about
  * cameras it already believed armed, so after a page load it never learned
  * that a camera was armed, and another device's change never showed. */
+const _reducedDet = {};   // 4.0.0 (C32): camera id -> judged from still pictures
+
 async function syncMotion(redraw) {
   try {
     const all = await (await fetch(BASE + '/api/motion')).json();
@@ -748,9 +764,11 @@ async function syncMotion(redraw) {
       const m  = all[cam.id] || {};
       const on = !!m.enabled, rec = !!m.recording;
       _recZone[cam.id] = m.zone || null;    // 3.4.0 (answer 16)
-      if (on !== !!_motionEnabled[cam.id] || rec !== !!_recording[cam.id]) {
+      const red = !!m.reduced;               // 4.0.0 (C32, answer 14)
+      if (on !== !!_motionEnabled[cam.id] || rec !== !!_recording[cam.id] || red !== !!_reducedDet[cam.id]) {
         _motionEnabled[cam.id] = on;
         _recording[cam.id]     = rec;
+        _reducedDet[cam.id]    = red;
         if (redraw) updateCard(cam);
       }
     });
@@ -810,12 +828,44 @@ function _csFill(d) {
   document.getElementById('cs-tail').value     = st.tail;
   sel.value                                    = st.clip;
   document.getElementById('cs-path').value     = st.path;
+  const engSel = document.getElementById('cs-engine');                      // 4.0.0 (C32)
+  if (engSel) { engSel.value = st.engine || 'classic'; csEngineShow(); }
   csLevelShow();
   const off = !!d.global;
+  _csGlobal = off;
   ['cs-level', 'cs-cooldown', 'cs-tail', 'cs-clip', 'cs-path', 'cs-save', 'cs-reset']
     .forEach(id => { document.getElementById(id).disabled = off; });
   document.getElementById('cs-global').style.display = off ? '' : 'none';
   _csZonesFill(d, off);
+}
+
+/* 4.0.0 (C32): the engine. Each camera keeps its own choice, also in global mode,
+ * where Save is off: there the choice is saved at once. */
+let _csGlobal = false;
+
+async function csEngineGlobalSave() {
+  const camId = _csCamId;
+  if (!camId || !_csGlobal) return;
+  const err = document.getElementById('cs-error');
+  try {
+    const r = await fetch(BASE + '/api/cameras/' + encodeURIComponent(camId) + '/motion/settings',
+                          {method: 'POST', headers: {'Content-Type': 'application/json'},
+                           body: JSON.stringify({engine: document.getElementById('cs-engine').value})});
+    const d = await r.json();
+    if (!r.ok) { err.textContent = d.error || 'Could not save'; return; }
+    showToast('Motion engine saved');
+  } catch (e) { err.textContent = 'Could not save: ' + e; }
+}
+
+function csEngineShow() {
+  const sel = document.getElementById('cs-engine'), help = document.getElementById('cs-engine-help');
+  if (!sel || !help) return;
+  const objects = sel.value === 'objects';
+  help.textContent = objects
+    ? 'Sensitivity sets the smallest object that records: more sensitive records smaller objects. '
+      + 'An object records once it has moved over 3 pictures; while it records it is followed into '
+      + 'other zones. At night a small, solid object that is only brighter or only darker counts as an insect.'
+    : 'Sensitivity sets how much of a zone, or of the picture, must change.';
 }
 
 function csLevelShow() {
@@ -835,6 +885,9 @@ function _csPeak(d) {
   const note = document.getElementById('cs-night-note');
   note.textContent = d.night_note || '';
   note.style.display = d.night_note ? '' : 'none';
+  // 4.0.0 (C32, answer 14): judged from still pictures
+  const dg = document.getElementById('cs-degraded');
+  if (dg) dg.style.display = d.detector === 'snapshots' ? '' : 'none';
   mark.style.display = 'none';
   // 3.4.0 (answer 14): each zone's largest change, and outside the zones
   const zp = document.getElementById('cs-zone-peaks');
@@ -858,12 +911,15 @@ function _csPeak(d) {
 async function saveCamSettings() {
   const camId = _csCamId;
   if (!camId) return;
+  const engSel = document.getElementById('cs-engine');
+  const engine = engSel ? engSel.value : 'classic';
   const body = {
     level:    parseInt(document.getElementById('cs-level').value, 10),
     cooldown: parseInt(document.getElementById('cs-cooldown').value, 10),
     tail:     parseInt(document.getElementById('cs-tail').value, 10),
     clip:     document.getElementById('cs-clip').value,
     path:     document.getElementById('cs-path').value.trim(),
+    engine,
   };
   const err = document.getElementById('cs-error');
   try {
@@ -3624,10 +3680,14 @@ function cardActions(cam, clearBtn, notCamBtn) {
   }
   const motOn = !!_motionEnabled[cam.id];
   const recOn = !!_recording[cam.id];
+  // 4.0.0 (C32, answer 14): detection reduced to still pictures
+  const red = motOn && !!_reducedDet[cam.id];
   const recBtn = (cam.status === 'ready' && ['proxy'].includes(cam.display || 'proxy'))
     ? '<button class="btn btn-sm ' + (recOn ? 'btn-rec-active' : (motOn ? 'btn-rec-on' : 'btn-rec-off'))
-      + '" onclick="toggleMotion(' + jsArg(cam.id) + ')" title="' + (motOn ? 'Motion recording on' : 'Enable motion recording') + '">'
-      + (recOn ? '⏺ REC' : (motOn ? '⏺ Armed' : '⏺ Record')) + '</button>'
+      + '" onclick="toggleMotion(' + jsArg(cam.id) + ')" title="'
+      + (red ? 'Detection reduced: judged from still pictures, about one a second (see the cog)'
+             : (motOn ? 'Motion recording on' : 'Enable motion recording')) + '">'
+      + (recOn ? '⏺ REC' : (motOn ? '⏺ Armed' : '⏺ Record')) + (red ? ' ⚠' : '') + '</button>'
     : '';
   // Globe button: opens camera web page (via Firefox addon or new tab)
   const webBtn = (cam.status === 'ready' && cam.ip)
@@ -4225,11 +4285,34 @@ function renderArpList() {
               ? '<span class="arp-host"> — ' + esc(h.hostname) + '</span>' : '')
           + '</label>';
       }).join('');
+  psUpdateButtons();
 }
 
 function onCbChange(cb) {
   if (cb.checked) _selectedIPs.add(cb.value);
   else            _selectedIPs.delete(cb.value);
+  psUpdateButtons();
+}
+
+// 4.1.0 (D6): the scans for chosen hosts are grey until a host is chosen
+let _psRunning = false;
+
+function psUpdateButtons() {
+  const none = !getSelectedIPs().length;
+  ['ps-deeper', 'ps-start'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = none || _psRunning;
+  });
+}
+
+function psSetRunning(on) {
+  _psRunning = !!on;
+  const show = on ? '' : 'none';
+  ['ps-pause', 'ps-cancel'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.style.display = show;
+  });
+  psUpdateButtons();
 }
 
 function arpSelectAll(val) {
@@ -4238,6 +4321,7 @@ function arpSelectAll(val) {
     if (val) _selectedIPs.add(cb.value);
     else     _selectedIPs.delete(cb.value);
   });
+  psUpdateButtons();
 }
 
 function getSelectedIPs() {
@@ -4246,19 +4330,19 @@ function getSelectedIPs() {
   return combined;
 }
 
-async function startPortScan() {
+// 4.1.0 (D6): mode 'deeper' (ports 1-10,000; cameras found get cards) or 'all'
+async function startPortScan(mode) {
+  mode = mode === 'deeper' ? 'deeper' : 'all';
   const ips = getSelectedIPs();
   if (!ips.length) { alert('Select at least one host or enter an IP address.'); return; }
 
-  const body = ips.length === 1 ? {ip: ips[0]} : {ips};
+  const body = ips.length === 1 ? {ip: ips[0], mode} : {ips, mode};
   const r = await fetch(BASE + '/api/pscan/start', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
   });
   if (!r.ok) { const d = await r.json(); alert(d.error || 'Scan failed'); return; }
-  document.getElementById('ps-start').disabled = true;
-  document.getElementById('ps-pause').style.display  = '';
-  document.getElementById('ps-cancel').style.display = '';
+  psSetRunning(true);
   document.getElementById('ps-prog-track').style.display = '';
   document.getElementById('port-table').style.display = 'none';
   document.getElementById('port-tbody').innerHTML = '';
@@ -4325,9 +4409,8 @@ async function pollPscan() {
     if (s.running) {
       pscanT = setTimeout(pollPscan, 2000);
     } else {
-      document.getElementById('ps-start').disabled  = false;
-      document.getElementById('ps-pause').style.display  = 'none';
-      document.getElementById('ps-cancel').style.display = 'none';
+      psSetRunning(false);
+      if (s.mode === 'deeper') loadCameras();        // 4.1.0 (D6): the cards it found
     }
   } catch { pscanT = setTimeout(pollPscan, 3000); }
 }
@@ -4416,9 +4499,7 @@ async function cancelPortScan() {
   await fetch(BASE + '/api/pscan/cancel', {method: 'POST'});
   _paused = false;
   document.getElementById('ps-pause').textContent = '⏸ Pause';
-  document.getElementById('ps-start').disabled = false;
-  document.getElementById('ps-pause').style.display  = 'none';
-  document.getElementById('ps-cancel').style.display = 'none';
+  psSetRunning(false);
 }
 
 /* ── Add camera ────────────────────────────────────────────────────────────── */
