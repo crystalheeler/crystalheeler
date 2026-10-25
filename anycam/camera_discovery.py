@@ -222,7 +222,7 @@ OUI_MAX_AGE_DAYS = 30  # re-download once a month
 # fingerprints will be submitted automatically.
 COMMUNITY_ENDPOINT = os.environ.get("ANYCAM_COMMUNITY_URL", "")
 
-CURRENT_VERSION = "3.8.3"  # must match config.yaml
+CURRENT_VERSION = "3.9.0-rc1.0"  # must match config.yaml
 
 INGRESS_PATH = os.environ.get("INGRESS_PATH", "").rstrip("/")
 PORT         = int(os.environ.get("INGRESS_PORT", 8099))
@@ -2144,11 +2144,11 @@ async def main() -> None:
     else:  # "routine"
         log.info(f"Routine restart (v{CURRENT_VERSION}) — loaded {len(CAMERAS)} saved camera(s)")
 
-    # Record the current version so next startup can compare
-    # Also save last scan duration so we can use it for future ETA estimates
-    # 3.0.1: keep the F10 marker too, or the defaults would be set again.
-    _runtime_data = {k: v for k, v in load_runtime().items()
-                     if k in ("last_scan_duration", "store_defaults_set")}
+    # Record the current version so next startup can compare.
+    # 3.9.0 (B79): keep every other entry. Until 3.8.4 only last_scan_duration
+    # and store_defaults_set were kept, so every start dropped the saved card
+    # order (D3) and the scan's stage times.
+    _runtime_data = load_runtime()
     _runtime_data["version"] = CURRENT_VERSION
     save_runtime(_runtime_data)
     asyncio.create_task(_store_defaults_once())      # 3.0.1 (F10)

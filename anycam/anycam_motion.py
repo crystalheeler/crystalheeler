@@ -139,8 +139,12 @@ def _motion_feed(camera_id: str, thumb: tuple[bytes, float, float], now_m: float
     moved = (ref is not None and _motion_decide(camera_id, ms, ref, thumb, t, live)
              and (live or ms["recording"] or _motion_second_look(camera_id, older, thumb)))
     # 3.4.0 (C17, answer 11): slow movement inside a zone
-    if not moved and anycam_zones.has_zones(camera_id):
+    if moved:
+        ms.pop("cal_slow", None)          # 3.9.0 (B74): the fast checks started it
+    elif anycam_zones.has_zones(camera_id):
         moved = _motion_slow_look(camera_id, ms, thumb, t)
+        if moved and ms["recording"]:
+            _motion_note_rec_zones(ms, [ms.get("judge_zone")])      # 3.9.0 (C31)
     if moved:
         ms["last_motion"] = now_m
         if not ms["recording"]:
@@ -168,9 +172,15 @@ def _motion_decide(camera_id: str, ms: dict, ref: tuple, thumb: tuple,
             log.info(f"Motion [{camera_id}]: {hits[0][1]:.1f}% changed in one picture "
                      f"only — not recorded (most often an insect near the lens)")
             _cal_reason(ms, "one picture only (often an insect near the lens)")
+            # 3.9.0 (B78): nor may the slow-movement check use that picture later
+            ms.setdefault("slow_taint", collections.deque(maxlen=8)).append(hits[0][0])
         hits.clear()
     if verdict == "light":
         ms["light_until"] = t + MOTION_LIGHT_HOLD_S
+        hits.clear()
+        _motion_slow_forget(ms)          # 3.9.0 (B73)
+        return False
+    if _motion_light_pause(camera_id, ms, t):      # 3.9.0 (C30)
         hits.clear()
         return False
     # One big change records one picture later, unless that picture shows a
@@ -202,6 +212,131 @@ def _motion_decide(camera_id: str, ms: dict, ref: tuple, thumb: tuple,
     return sum(1 for h in hits if h[3] == zone) >= 2
 
 
+# ── 3.9.0 (C30): passing lights (vehicle headlights) ─────────────────────────
+# CrystalHeeler, 2026-10-24: headlights made most night recordings (14 of 25 on
+# 2026-10-22/23). A car's light reaches several zones at once, 1-10% of the
+# picture, far under the 75% light rule. Measured on 326 recordings of
+# 2026-10-20 to 24 (docs/Recording_Review_2026-10-24.md, sections 7-8): when a
+# headlight arrives, 90-100% of the changed cells get brighter, by +32 to +46
+# grey levels, out of a quiet picture; a walking person or a cat is about half
+# brighter, half darker. Such a change pauses detection until the picture
+# settles. A darker-only change never starts a pause (a person in dark clothes
+# walking in looks like that), but continues one while the beam leaves.
+LIGHT_SWEEP_MIN_PCT   = 0.5    # % of the picture that changed
+LIGHT_SWEEP_SHARE     = 0.90   # of the changed cells, this share brighter (or darker)
+LIGHT_SWEEP_DELTA     = 25.0   # by at least this many grey levels on average
+LIGHT_QUIET_BEFORE_S  = 1.5    # the picture before it was quiet for this long:
+LIGHT_QUIET_BEFORE_PCT = 1.5   #   nothing over this % changed, unless ...
+LIGHT_GROWING_SHARE   = 0.75   #   ... it was itself this much brighter (a light growing)
+LIGHT_SWEEP_FILL_MAX  = 0.35   # changed cells / their bounding box: a lit lawn is scattered
+                               # (at most 0.25 at the start of 71 headlight pauses), a
+                               # person or an animal is one solid shape (2026-10-24)
+LIGHT_QUIET_PCT       = 0.3    # two comparisons under this end the pause
+LIGHT_PAUSE_MAX_S     = 4.0    # a pause lasts at most this long
+LIGHT_TAIL_S          = 3.0    # a darker-only change this soon after a pause continues it
+LIGHT_PAUSE_TOTAL_S   = 6.0    # one passing light pauses at most this long in all
+LIGHT_PREROLL_GAP_S   = 1.5    # a recording this soon after a pause starts before it
+
+
+def _motion_light_dir(prev: tuple, curr: tuple, flags: bytes) -> tuple[float, float, float]:
+    """(share of the changed cells that got brighter, their mean grey-level change,
+    their share of the box around them)."""
+    pa, ca = prev[0], curr[0]
+    idx = [i for i, f in enumerate(flags) if f]
+    if not idx:
+        return 0.5, 0.0, 0.0
+    deltas = [ca[i] - pa[i] for i in idx]
+    gw = _grid_of(len(flags))[0]
+    xs, ys = [i % gw for i in idx], [i // gw for i in idx]
+    box = (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1)
+    return (sum(1 for d in deltas if d > 0) / len(deltas), sum(deltas) / len(deltas),
+            len(idx) / box)
+
+
+def _motion_light_pause(camera_id: str, ms: dict, t: float) -> bool:
+    """True while a passing light pauses detection (C30); starts and ends pauses."""
+    pct, share, mean, fill = ms.get("cmp", (0.0, 0.5, 0.0, 1.0))
+    hist = ms.setdefault("lp_hist", collections.deque(maxlen=16))
+    lp, chroma = ms.get("lp"), ms.get("chroma")
+    paused = False
+    if lp:
+        if (lp["chroma0"] is not None and lp["chroma0"] <= NIGHT_CHROMA_MAX
+                and chroma is not None and chroma >= DAY_CHROMA_MIN):
+            # The camera turned from infrared to colour: a light was switched on
+            # (the porch light, 2026-10-20 and 21), and a person most often follows.
+            # The camera switches about 2 s after the light comes on, so the pause
+            # had begun; the next recording starts before it (lp_last).
+            ms["lp"] = None
+            ms["lp_last"] = {"end": t, "first": lp["first"], "start_m": lp["start_m"],
+                             "end_m": time.monotonic()}
+            log.info(f"Motion [{camera_id}]: the camera turned to colour — a light was "
+                     f"switched on, not a passing one; detection goes on")
+        else:
+            lp["quiet"] = lp["quiet"] + 1 if pct < LIGHT_QUIET_PCT else 0
+            if (lp["quiet"] >= 2 or t - lp["t0"] >= LIGHT_PAUSE_MAX_S
+                    or t - lp["first"] >= LIGHT_PAUSE_TOTAL_S):
+                ms["lp"] = None
+                ms["lp_last"] = {"end": t, "first": lp["first"], "start_m": lp["start_m"],
+                                 "end_m": time.monotonic()}
+                log.debug(f"Motion [{camera_id}]: passing light over after "
+                          f"{t - lp['first']:.1f} s; detection goes on")
+            else:
+                paused = True
+    else:
+        strong = pct >= LIGHT_SWEEP_MIN_PCT and abs(mean) >= LIGHT_SWEEP_DELTA
+        bright = strong and mean > 0 and share >= LIGHT_SWEEP_SHARE and fill <= LIGHT_SWEEP_FILL_MAX
+        dark = strong and mean < 0 and share <= 1.0 - LIGHT_SWEEP_SHARE
+        before = [x for x in hist if t - LIGHT_QUIET_BEFORE_S - 1e-6 <= x[0] < t]
+        # a light that grows is scattered too; a solid bright shape is something moving
+        quiet_before = all(x[1] < LIGHT_QUIET_BEFORE_PCT
+                           or (x[2] >= LIGHT_GROWING_SHARE and x[3] <= LIGHT_SWEEP_FILL_MAX)
+                           for x in before)
+        last = ms.get("lp_last")
+        colour_now = bool(ms.get("night")) and chroma is not None and chroma >= DAY_CHROMA_MIN
+        start = None
+        if bright and quiet_before and not colour_now:
+            start = {"t0": t, "first": t, "start_m": time.monotonic()}
+            what = (f"a passing light ({pct:.1f}% of the picture, {share:.0%} of it brighter "
+                    f"by {mean:+.0f})")
+        elif (dark and last and t - last["end"] <= LIGHT_TAIL_S
+                and t - last["first"] < LIGHT_PAUSE_TOTAL_S):
+            start = {"t0": t, "first": last["first"], "start_m": last["start_m"]}
+            what = "the passing light leaving"
+        if start:
+            ms["lp"] = {**start, "quiet": 0, "chroma0": chroma}
+            _motion_slow_forget(ms)
+            log.info(f"Motion [{camera_id}]: {what} — detection paused until the picture settles")
+            paused = True
+    hist.append((t, pct, share, fill))
+    if paused:
+        # also keeps the slow-movement check out (it honours light_until)
+        ms["light_until"] = max(ms.get("light_until", float("-inf")), t + 0.6)
+        _cal_reason(ms, "a passing light (headlights)")
+    return paused
+
+
+def _motion_light_preroll(ms: dict, now_m: float) -> float:
+    """3.9.0 (C30): seconds of pre-roll; a recording right after a pause starts before it.
+
+    The front door's glass pauses detection like a light, then a person steps
+    out (2026-10-23 20:26:49): the file then holds the door opening too.
+    """
+    last = ms.get("lp_last")
+    if last and now_m - last["end_m"] <= LIGHT_PREROLL_GAP_S:
+        return min(MOTION_PREROLL_S + (now_m - last["start_m"]), MOTION_BUF_KEEP_S)
+    return MOTION_PREROLL_S
+
+
+def _motion_slow_forget(ms: dict) -> None:
+    """3.9.0 (B73): after a light change the slow check compares only newer pictures.
+
+    Its reference is ZONE_SLOW_S old, longer than the light hold, so at dusk it
+    compared with a picture from before the infrared switch and recorded it.
+    """
+    ms["slow_refs"] = collections.deque()
+    ms["slow_runs"] = {}
+
+
 def _motion_second_look(camera_id: str, older: tuple | None, thumb: tuple) -> bool:
     """3.0.1 (B20): True when the picture also differs from an older one."""
     if older is None or len(older[0]) != len(thumb[0]):
@@ -223,6 +358,9 @@ def _motion_second_look(camera_id: str, older: tuple | None, thumb: tuple) -> bo
     return False
 
 
+SLOW_TAINT_S = 0.6     # 3.9.0 (B78): pictures this close to a rejected insect picture
+
+
 def _motion_slow_look(camera_id: str, ms: dict, thumb: tuple, t: float) -> bool:
     """3.4.0 (C17, answer 11): a zone also compares with the picture ZONE_SLOW_S old.
 
@@ -237,7 +375,10 @@ def _motion_slow_look(camera_id: str, ms: dict, thumb: tuple, t: float) -> bool:
     old = slow[0][1] if slow and t - slow[0][0] >= age else None
     slow.append((t, thumb))
     runs = ms.setdefault("slow_runs", {})
-    if (old is None or len(old[0]) != len(thumb[0])
+    # 3.9.0 (B78): a picture the fast checks rejected as an insect is no reference
+    old_t = slow[0][0] if slow else None
+    tainted = old_t is not None and any(abs(old_t - x) <= SLOW_TAINT_S for x in ms.get("slow_taint", ()))
+    if (old is None or len(old[0]) != len(thumb[0]) or tainted
             or t < ms.get("light_until", float("-inf"))):
         runs.clear()
         return False
@@ -256,8 +397,11 @@ def _motion_slow_look(camera_id: str, ms: dict, thumb: tuple, t: float) -> bool:
         return False
     runs.clear()
     ms["judge_zone"] = winner
-    log.info(f"Motion [{camera_id}]: zone \"{winner}\" changed over "
-             f"{anycam_zones.ZONE_SLOW_S:.0f} s on two pictures in a row (slow movement)")
+    if not ms["recording"]:                                 # 3.9.0 (B74): it starts this one
+        ms["cal_slow"] = next(((n, p, need) for n, p, need in _motion_zone_results(camera_id, flags)
+                               if n == winner), None)
+    _motion_check_log(ms, ("slow", winner), f"Motion [{camera_id}]: zone \"{winner}\" changed "
+                      f"over {anycam_zones.ZONE_SLOW_S:.0f} s on two pictures in a row (slow movement)")
     return True
 
 
@@ -381,6 +525,27 @@ def _motion_cells(prev: tuple[bytes, float, float],
     return flags, changed / len(ca), busy / len(per_region)
 
 
+# 3.9.0 (B70): the per-check lines were 62-66% of a 10,000-line log export
+# (about 4 a second during movement). Each kind now logs at DEBUG when a
+# movement starts (quiet for CHECK_LOG_GAP_S before) and then at most once
+# every CHECK_LOG_EVERY_S while it lasts; the calibration log gives one line
+# per movement. DEBUG alone was not enough: log_debug is on by default.
+CHECK_LOG_GAP_S = 1.0
+CHECK_LOG_EVERY_S = 5.0
+
+
+def _motion_check_log(ms: dict, key: object, text: str, now_m: float | None = None) -> None:
+    """Log a per-check line at the start of a movement, then at most every CHECK_LOG_EVERY_S."""
+    now_m = time.monotonic() if now_m is None else now_m
+    seen = ms.setdefault("check_log", {})
+    st = seen.get(key)
+    if st is None or now_m - st[1] > CHECK_LOG_GAP_S or now_m - st[0] >= CHECK_LOG_EVERY_S:
+        log.debug(text)
+        seen[key] = [now_m, now_m]
+    else:
+        st[1] = now_m
+
+
 def _motion_zone_results(camera_id: str, flags: bytes) -> list[tuple[str | None, float, float]]:
     """Each zone, and outside the zones, as (name, % changed, % needed)."""
     boost = _motion_boost(camera_id)
@@ -396,6 +561,7 @@ def _motion_judge(camera_id: str, prev: tuple[bytes, float, float],
     pct = frac * 100.0
     ms = _MOTION.get(camera_id) or {}
     ms["judge_zone"] = None
+    ms["cmp"] = (pct, *_motion_light_dir(prev, curr, flags))      # 3.9.0 (C30)
     _motion_note_peak(camera_id, pct, spread > MOTION_LIGHT_FRACTION)
     if _cal_on():                                       # 3.8.2: the calibration log
         zoned = anycam_zones.has_zones(camera_id)
@@ -414,18 +580,20 @@ def _motion_judge(camera_id: str, prev: tuple[bytes, float, float],
         # 3.4.0 (C17): each zone on its own cells, outside the zones on the rest
         results = _motion_zone_results(camera_id, flags)
         _motion_note_zone_peaks(ms, results)
+        if ms.get("recording"):
+            _motion_note_rec_zones(ms, [n for n, p, need in results if p >= need])   # 3.9.0 (C31)
         hit = anycam_zones.best_pass(results)
         if hit is None:
             return "", max((p for _n, p, _need in results), default=0.0)
         name, zpct = hit
         ms["judge_zone"] = name
         need = next(nd for n, _p, nd in results if n == name)
-        log.info(f"Motion [{camera_id}]: {zpct:.1f}% of {_zone_label(name)} changed "
-                 f"(threshold {need:.1f}%)")
+        _motion_check_log(ms, ("zone", name), f"Motion [{camera_id}]: {zpct:.1f}% of "
+                          f"{_zone_label(name)} changed (threshold {need:.1f}%)")
         return "motion", zpct
     if pct >= area:
-        log.info(f"Motion [{camera_id}]: {pct:.1f}% of the picture changed "
-                 f"(threshold {area:.1f}%)")
+        _motion_check_log(ms, ("picture",), f"Motion [{camera_id}]: {pct:.1f}% of the "
+                          f"picture changed (threshold {area:.1f}%)")
         return "motion", pct
     if pct >= area / 2:
         log.debug(f"Motion [{camera_id}]: {pct:.1f}% changed, under the "
@@ -484,10 +652,26 @@ def _cal_reason(ms: dict, reason: str) -> None:
 
 
 def _cal_recorded(ms: dict, zone: str | None, base: str) -> None:
-    """A recording started: the movement that started it gets the file name."""
-    for name, ev in (ms.get("cal") or {}).items():
+    """A recording started: the movement that started it gets the file name.
+
+    3.9.0 (B74): a recording the slow-movement check started has often no open
+    movement for its zone (the fast checks stayed below the floor), so it got
+    no line. It gets one now, marked as slow movement.
+    """
+    slow = ms.pop("cal_slow", None)          # (zone, % changed, % needed) from _motion_slow_look
+    events = ms.setdefault("cal", {})
+    if slow is not None and slow[0] == zone and zone not in events:
+        now_m = time.monotonic()
+        events[zone] = {"wall": time.time(), "start": now_m, "last": now_m, "peak": slow[1],
+                        "need": slow[2], "during": False, "outcome": None, "reason": None,
+                        "label": _cal_label(zone, True)}
+    for name, ev in events.items():
         if ev.get("outcome") is None:
-            ev["outcome"] = f"recorded → {base}" if name == zone else "during a recording"
+            if name == zone:
+                how = " (slow movement, over 5 s)" if slow is not None and slow[0] == zone else ""
+                ev["outcome"] = f"recorded{how} → {base}"
+            else:
+                ev["outcome"] = "during a recording"
 
 
 def _cal_outcome(ev: dict) -> str:
@@ -498,6 +682,12 @@ def _cal_outcome(ev: dict) -> str:
     if ev["peak"] < ev["need"]:
         return "not recorded: below the threshold"
     return f"not recorded: {ev.get('reason') or 'passed the threshold, not confirmed'}"
+
+
+def _cal_pcts(peak: float, need: float) -> tuple[str, str]:
+    """3.9.0 (B72): "peak 1.5% (records at 1.5%) — not recorded" read as a contradiction."""
+    a, b = f"{peak:.1f}", f"{need:.1f}"
+    return (f"{peak:.2f}", f"{need:.2f}") if a == b else (a, b)
 
 
 def _cal_flush(camera_id: str, ms: dict, now_m: float, force: bool = False) -> None:
@@ -516,9 +706,10 @@ def _cal_flush(camera_id: str, ms: dict, now_m: float, force: bool = False) -> N
             continue
         ms["cal_lines"] += 1
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["wall"]))
+        peak, need = _cal_pcts(ev["peak"], ev["need"])
         log.info(f"Motion [{camera_id}]: {when} {ev['label']}: movement "
-                 f"{max(0.0, ev['last'] - ev['start']):.1f} s, peak {ev['peak']:.1f}% "
-                 f"(records at {ev['need']:.1f}%) — {_cal_outcome(ev)}")
+                 f"{max(0.0, ev['last'] - ev['start']):.1f} s, peak {peak}% "
+                 f"(records at {need}%) — {_cal_outcome(ev)}")
 
 
 # ── 2.6.6: tuning line ──────────────────────────────────────────────────────
@@ -553,6 +744,19 @@ def _motion_note_zone_peaks(ms: dict, results: list) -> None:
             peaks[name] = (pct, need)
 
 
+def _motion_note_rec_zones(ms: dict, names: list) -> None:
+    """3.9.0 (C31): the zones that passed during a recording, in the order they did.
+
+    A person who walked through four zones made one file named after the
+    first; the other three zones had detected the person too, but nothing
+    showed it. The Storage tab now lists them all.
+    """
+    seen = ms.setdefault("rec_zone_list", [])
+    for name in names:
+        if name is not None and name not in seen:
+            seen.append(name)
+
+
 def _motion_zone_peak_text(peaks: dict) -> str:
     return ", ".join(
         f"{n if n is not None else 'outside'}: peak {p:.1f}% (records at {need:.1f}%)"
@@ -571,8 +775,11 @@ def _motion_report_peak(camera_id: str, ms: dict, now_m: float) -> None:
     zone_peaks = ms.pop("zone_peaks", None)
     if zone_peaks:
         ms["last_zone_peaks"] = zone_peaks
-        log.info(f"Motion [{camera_id}]: zones in the last {MOTION_PEAK_REPORT_S} s: "
-                 f"{_motion_zone_peak_text(zone_peaks)}")
+        # 3.9.0 (B70): INFO only when a zone saw movement, DEBUG for a still minute
+        moved = any(p >= CAL_FLOOR_MIN_PCT for p, _need in zone_peaks.values())
+        (log.info if moved else log.debug)(
+            f"Motion [{camera_id}]: zones in the last {MOTION_PEAK_REPORT_S} s: "
+            f"{_motion_zone_peak_text(zone_peaks)}")
     if not n:
         return
     ms["last_peak_pct"] = pct      # for the settings panel's live readout
@@ -607,6 +814,12 @@ def _motion_finish_files(camera_id: str, ms: dict) -> None:
     base, clip = ms.get("clip_base"), ms.get("clip_path")
     if not (base and clip):
         return
+    # 3.9.0 (C31): the Storage tab shows every zone the recording passed through
+    zones = ms.get("rec_zone_list") or []
+    if zones and anycam_zones.REC_ZONES.get(base) != ", ".join(zones):
+        anycam_zones.REC_ZONES[base] = ", ".join(zones)
+        ms["rec_zones_dirty"] = True
+    also = f" (zones: {', '.join(zones)})" if len(zones) > 1 else ""
     parts = sorted(clip.parent.glob(f"{base}_part*.mp4"))
     if len(parts) == 1:
         single = clip.parent / f"{base}.mp4"
@@ -616,11 +829,11 @@ def _motion_finish_files(camera_id: str, ms: dict) -> None:
         except OSError as ex:
             log.warning(f"Motion [{camera_id}]: could not rename {parts[0].name}: {ex}")
             single = parts[0]
-        log.info(f"Motion [{camera_id}]: recording stopped → {single}")
+        log.info(f"Motion [{camera_id}]: recording stopped → {single}{also}")
         parts = [single]
     elif parts:
         log.info(f"Motion [{camera_id}]: recording stopped → {len(parts)} files, "
-                 f"{parts[0].name} to {parts[-1].name}")
+                 f"{parts[0].name} to {parts[-1].name}{also}")
     else:
         log.warning(f"Motion [{camera_id}]: recording stopped, but no file was "
                     f"written in {clip.parent} — see the REC: lines above")
@@ -878,6 +1091,9 @@ def _motion_ensure_loop(camera_id: str) -> None:
 MOTION_PREROLL_S = 3.0          # every recording starts at least this early
 MOTION_DETECT_FPS = 4
 MOTION_BUF_MAX_S = 20.0         # memory bound if keyframes are far apart
+# 3.9.0 (C30): a recording right after a headlight pause starts before the
+# pause, so the buffer keeps that much more (about 10 MB at 8 Mbit/s).
+MOTION_BUF_KEEP_S = MOTION_PREROLL_S + 6.0 + 1.0
 MOTION_PIPE_RETRY_S = 10.0
 # 3.0.1 (B20): a stream that keeps failing (the DVR's sub-stream answered
 # 404 1,970 times in 86 minutes) is retried at 10 s, 20 s, 40 s ... up to
@@ -901,6 +1117,7 @@ class _TsBuffer:
         self.rest = b""
         self.gops: collections.deque = collections.deque()   # [start time, bytearray]
         self.psi: dict[int, bytes] = {}                       # latest PAT and PMT
+        self.now = 0.0                                        # time of the last feed
 
     def feed(self, data: bytes, now: float) -> bytes:
         """Add stream bytes; return the complete packets among them."""
@@ -921,24 +1138,32 @@ class _TsBuffer:
                 self.gops.append([now, bytearray()])
             if self.gops:
                 self.gops[-1][1] += pkt
+        self.now = now
         self._trim(now)
         return out
 
     def _trim(self, now: float) -> None:
-        while len(self.gops) > 1 and now - self.gops[1][0] >= MOTION_PREROLL_S:
+        while len(self.gops) > 1 and now - self.gops[1][0] >= MOTION_BUF_KEEP_S:
             self.gops.popleft()
         while len(self.gops) > 1 and now - self.gops[0][0] > MOTION_BUF_MAX_S:
             self.gops.popleft()
 
-    def preroll(self) -> bytes:
-        """PAT, PMT, then everything from the buffered keyframe on."""
+    def _first(self, want_s: float) -> int:
+        """The newest keyframe at least want_s old, else the oldest kept."""
+        for i in range(len(self.gops) - 1, -1, -1):
+            if self.now - self.gops[i][0] >= want_s:
+                return i
+        return 0
+
+    def preroll(self, want_s: float = MOTION_PREROLL_S) -> bytes:
+        """PAT, PMT, then everything from the keyframe at least want_s old on."""
         if not self.gops:
             return b""
         head = b"".join(self.psi[pid] for pid in (0, TS_PMT_PID) if pid in self.psi)
-        return head + b"".join(bytes(g[1]) for g in self.gops)
+        return head + b"".join(bytes(g[1]) for g in list(self.gops)[self._first(want_s):])
 
-    def preroll_seconds(self, now: float) -> float:
-        return now - self.gops[0][0] if self.gops else 0.0
+    def preroll_seconds(self, now: float, want_s: float = MOTION_PREROLL_S) -> float:
+        return now - self.gops[self._first(want_s)][0] if self.gops else 0.0
 
 
 def _motion_detect_source(camera: dict) -> str | None:
@@ -1432,6 +1657,7 @@ async def _motion_keeper() -> None:
                     log.warning(f"Motion [{camera_id}]: recording ffmpeg exited "
                                 f"(rc={proc.returncode}) → {ms.get('clip_path')}")
                     _motion_finish_files(camera_id, ms)
+                    await _rec_zones_save_if_dirty(ms)
                     ms["recording"] = False
                     ms["proc"] = None
                 elif ms["recording"] and (not ms["enabled"] or _motion_quiet(camera_id, ms, now_m)):
@@ -1678,6 +1904,15 @@ def _rec_zones_read() -> dict:
     return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
+async def _rec_zones_save_if_dirty(ms: dict) -> None:
+    """3.9.0 (C31): write recording_zones.json when a finished recording changed it."""
+    if ms.pop("rec_zones_dirty", False):
+        try:
+            await asyncio.to_thread(_rec_zones_save)
+        except OSError as ex:
+            log.warning(f"Motion: could not save {_rec_zones_file()}: {ex}")
+
+
 def _rec_zones_save() -> None:
     """3.4.0 (answer 15): which zone started each recording, for the Storage tab."""
     keep = dict(list(anycam_zones.REC_ZONES.items())[-anycam_zones.REC_ZONES_MAX:])
@@ -1781,6 +2016,7 @@ async def _start_recording(camera_id: str, camera: dict, url: str) -> None:
     ms["clip_path"] = clip
     ms["clip_base"] = base
     ms["rec_zone"] = zone
+    ms["rec_zone_list"] = [zone] if zone is not None else []     # 3.9.0 (C31)
     if _cal_on():
         _cal_recorded(ms, zone, base)                   # 3.8.2: the calibration log
     if zone is not None:
@@ -1803,10 +2039,12 @@ async def _start_recording(camera_id: str, camera: dict, url: str) -> None:
         # 2.6.6: start from the buffer — the file begins at a keyframe at
         # least MOTION_PREROLL_S before the motion. Packets that arrive
         # while the writer starts are queued, then handed over in order.
-        ms["rec_queue"] = bytearray(buf.preroll())
-        pre_s = buf.preroll_seconds(time.monotonic())
+        want_s = _motion_light_preroll(ms, time.monotonic())       # 3.9.0 (C30)
+        ms["rec_queue"] = bytearray(buf.preroll(want_s))
+        pre_s = buf.preroll_seconds(time.monotonic(), want_s)
+        light = ", which includes a passing light" if want_s > MOTION_PREROLL_S else ""
         log.info(f"Motion [{camera_id}]: recording started → {clip} (from "
-                 f"{pre_s:.1f} s before the motion; a new file every "
+                 f"{pre_s:.1f} s before the motion{light}; a new file every "
                  f"{cfg['clip_s']} s while motion continues)")
         try:
             writer = await asyncio.create_subprocess_exec(
@@ -1883,6 +2121,7 @@ async def _stop_recording(camera_id: str) -> None:
                 except ProcessLookupError:
                     pass
         _motion_finish_files(camera_id, ms)
+        await _rec_zones_save_if_dirty(ms)
     finally:
         ms["recording"] = False
         ms["proc"]      = None

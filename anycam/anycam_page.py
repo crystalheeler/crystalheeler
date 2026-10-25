@@ -280,6 +280,8 @@ header h1{{cursor:pointer}}
         padding:20px;width:min(360px,calc(100vw - 32px));display:flex;flex-direction:column;gap:12px;
         max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);overflow-y:auto}}
 /* 3.8.2 (B67, rule 10): a tall dialog scrolls inside itself, and its buttons stay in view */
+/* 3.8.4 (B68): its parts keep their height; shrunk to fit the cap, long text ran over the next line */
+.modal>*{{flex-shrink:0}}
 .modal h3{{font-size:.92rem;font-weight:600}}
 .modal input{{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.86rem;padding:7px 10px;outline:none}}
 .modal input:focus{{border-color:var(--primary)}}
@@ -354,7 +356,7 @@ header h1{{cursor:pointer}}
 .zl-lev input{{flex:1;accent-color:var(--primary)}}
 .zl-note{{grid-column:1 / span 2;color:#f5b942;font-size:.74rem}}
 .zl-empty{{color:#888}}
-.stor-zone{{margin-left:8px;font-size:.72rem;color:var(--orange);border:1px solid var(--orange);border-radius:6px;padding:0 5px}}
+.stor-zone{{margin-left:8px;font-size:.72rem;color:var(--orange);border:1px solid var(--orange);border-radius:6px;padding:0 5px;max-width:45%;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}  /* 3.9.0 (C31): a list of zones */
 @media (max-width:700px){{#zone-panel{{left:8px;right:8px;top:auto;bottom:60px;width:auto;max-height:45dvh}}
   #focus-zone-ctl label{{display:none}}}}
 .nc-modal-inner{{width:min(460px,94vw)}}
